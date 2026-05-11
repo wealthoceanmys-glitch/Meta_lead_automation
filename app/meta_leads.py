@@ -134,4 +134,4 @@ def process_leadgen_payload(payload: Dict[str, Any]) -> List[str]:
         append_lead_to_sheet(row)
         processed.append(row.get('lead_id', leadgen_id))
 
-    return processed
+    return processed 
