@@ -1,14 +1,30 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import META_VERIFY_TOKEN
-from app.meta_leads import process_leadgen_payload, normalize_phone
+from app.config import META_VERIFY_TOKEN, get_env
+from app.meta_leads import process_leadgen_payload, normalize_phone, subscribe_page_to_app
 from app.sheets import append_lead_to_sheet
 
-app = FastAPI(title='Meta Leads to Google Sheets', version='1.0.0')
+META_PAGE_ID = get_env('META_PAGE_ID')  # Add this to Render env vars
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Subscribe page to app on startup so webhooks are routed correctly
+    if META_PAGE_ID:
+        print(f'Subscribing page {META_PAGE_ID} to leadgen webhooks...')
+        ok = subscribe_page_to_app(META_PAGE_ID)
+        print('Page subscription result:', ok)
+    else:
+        print('WARNING: META_PAGE_ID not set — skipping page subscription')
+    yield
+
+
+app = FastAPI(title='Meta Leads to Google Sheets', version='1.1.0', lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,7 +46,6 @@ def health():
 @app.get('/webhook/meta-leads')
 async def verify_meta_webhook(request: Request):
     params = dict(request.query_params)
-
     mode = params.get('hub.mode')
     token = params.get('hub.verify_token')
     challenge = params.get('hub.challenge')
@@ -80,9 +95,7 @@ async def test_sheet(payload: Dict[str, Any]):
         'campaign_id': payload.get('campaign_id', 'manual'),
         'raw_data': str(payload),
     }
-
     append_lead_to_sheet(row)
-
     return {
         'success': True,
         'message': 'Test row added to Google Sheet',
