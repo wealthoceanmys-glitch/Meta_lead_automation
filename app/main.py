@@ -9,18 +9,20 @@ from app.config import META_VERIFY_TOKEN, get_env
 from app.meta_leads import process_leadgen_payload, normalize_phone, subscribe_page_to_app
 from app.sheets import append_lead_to_sheet
 
-META_PAGE_ID = get_env('META_PAGE_ID')  # Add this to Render env vars
+META_PAGE_ID = get_env('META_PAGE_ID')
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Subscribe page to app on startup so webhooks are routed correctly
-    if META_PAGE_ID:
-        print(f'Subscribing page {META_PAGE_ID} to leadgen webhooks...')
-        ok = subscribe_page_to_app(META_PAGE_ID)
-        print('Page subscription result:', ok)
-    else:
-        print('WARNING: META_PAGE_ID not set — skipping page subscription')
+    try:
+        if META_PAGE_ID:
+            print(f'Subscribing page {META_PAGE_ID} to leadgen webhooks...')
+            ok = subscribe_page_to_app(META_PAGE_ID)
+            print('Page subscription result:', ok)
+        else:
+            print('WARNING: META_PAGE_ID not set — skipping page subscription')
+    except Exception as exc:
+        print('WARNING: Page subscription failed on startup (non-fatal):', exc)
     yield
 
 
@@ -37,10 +39,7 @@ app.add_middleware(
 
 @app.get('/')
 def health():
-    return {
-        'status': 'ok',
-        'service': 'meta-leads-to-google-sheets',
-    }
+    return {'status': 'ok', 'service': 'meta-leads-to-google-sheets'}
 
 
 @app.get('/webhook/meta-leads')
@@ -66,16 +65,10 @@ async def receive_meta_lead(request: Request):
 
     try:
         processed = process_leadgen_payload(payload)
-        return {
-            'success': True,
-            'processed': processed,
-        }
+        return {'success': True, 'processed': processed}
     except Exception as exc:
         print('Lead webhook error:', str(exc))
-        return {
-            'success': False,
-            'error': str(exc),
-        }
+        return {'success': False, 'error': str(exc)}
 
 
 @app.post('/test/sheet')
@@ -96,8 +89,4 @@ async def test_sheet(payload: Dict[str, Any]):
         'raw_data': str(payload),
     }
     append_lead_to_sheet(row)
-    return {
-        'success': True,
-        'message': 'Test row added to Google Sheet',
-        'row': row,
-    }
+    return {'success': True, 'message': 'Test row added to Google Sheet', 'row': row}
