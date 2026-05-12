@@ -96,3 +96,28 @@ async def test_sheet(payload: Dict[str, Any]):
     }
     append_lead_to_sheet(row)
     return {'success': True, 'message': 'Test row added to Google Sheet', 'row': row}
+
+import asyncio
+import httpx
+
+async def keep_alive():
+    """Ping self every 10 minutes to prevent Render free tier sleep."""
+    await asyncio.sleep(60)  # wait for server to fully start
+    url = get_env('RENDER_EXTERNAL_URL', '')
+    if not url:
+        print('RENDER_EXTERNAL_URL not set — keep-alive disabled')
+        return
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(f'{url}/', timeout=10)
+                print(f'Keep-alive ping: {r.status_code}')
+        except Exception as e:
+            print(f'Keep-alive ping failed: {e}')
+        await asyncio.sleep(600)  # every 10 minutes
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ... existing page subscription code ...
+    asyncio.create_task(keep_alive())  # add this line
+    yield
