@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: meta-leads-sheets-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: META_VERIFY_TOKEN
+        sync: false
+      - key: META_GRAPH_VERSION
+        value: v22.0
+      - key: META_PAGE_ACCESS_TOKEN
+        sync: false
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON_BASE64
+        sync: false
+
+      - key: WHATSAPP_ENABLED
+        value: "false"
+      - key: WHATSAPP_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_ACCESS_TOKEN
+        sync: false
+      - key: WHATSAPP_TEMPLATE_NAME
+        value: hello_world
+      - key: WHATSAPP_LANGUAGE_CODE
+        value: en_US
+      - key: WHATSAPP_TEMPLATE_BODY_FIELDS
+        value: ""
