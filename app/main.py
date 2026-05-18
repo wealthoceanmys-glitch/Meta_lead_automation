@@ -23,9 +23,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -------------------------------------------------------------------
+# Keep-alive ping for Render free instance
+# Pings own public URL every 13 minutes to reduce spin-down.
+# -------------------------------------------------------------------
+import os
+import asyncio
+import httpx
+from contextlib import asynccontextmanager
+
+KEEP_ALIVE_TASK = None
+
+
+async def keep_alive_ping():
+    """
+    Render free services can spin down when inactive.
+    This background task pings the service every 13 minutes.
+    """
+    public_url = (
+        os.getenv("RENDER_EXTERNAL_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("APP_URL")
+    )
+
+    if not public_url:
+        print("Keep-alive disabled: RENDER_EXTERNAL_URL / PUBLIC_BASE_URL / APP_URL missing")
+        return
+
+    public_url = public_url.rstrip("/")
+    ping_url = f"{public_url}/"
+
+    print(f"Keep-alive enabled. Pinging every 13 minutes: {ping_url}")
+
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.get(ping_url)
+                print(f"Keep-alive ping: {response.status_code}")
+        except Exception as e:
+            print(f"Keep-alive ping failed: {e}")
+
+        await asyncio.sleep(13 * 60)
+
 @app.on_event("startup")
-def _startup():
-    init_db()
+async def start_keep_alive():
+    global KEEP_ALIVE_TASK
+
+    keep_alive_enabled = os.getenv("KEEP_ALIVE_ENABLED", "true").lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+    if keep_alive_enabled:
+        KEEP_ALIVE_TASK = asyncio.create_task(keep_alive_ping())
+
+
+@app.on_event("shutdown")
+async def stop_keep_alive():
+    global KEEP_ALIVE_TASK
+
+    if KEEP_ALIVE_TASK:
+        KEEP_ALIVE_TASK.cancel()
+        try:
+            await KEEP_ALIVE_TASK
+        except asyncio.CancelledError:
+            pass
 
 @app.get("/")
 def root():
