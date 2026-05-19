@@ -24,6 +24,15 @@ class Settings(BaseSettings):
     seminar_thursday_arrival: str = Field(default="5:45 PM", alias="SEMINAR_THURSDAY_ARRIVAL")
     seminar_sunday_time: str = Field(default="10:30 AM to 12:30 PM", alias="SEMINAR_SUNDAY_TIME")
     seminar_sunday_arrival: str = Field(default="10:15 AM", alias="SEMINAR_SUNDAY_ARRIVAL")
+    whatsapp_registration_template_name: str = os.getenv(
+        "WHATSAPP_REGISTRATION_TEMPLATE_NAME",
+        os.getenv("WHATSAPP_TEMPLATE_NAME", "woi_seminar_registration_followup")
+    )
+
+    whatsapp_invitation_template_name: str = os.getenv(
+        "WHATSAPP_INVITATION_TEMPLATE_NAME",
+        "woi_free_seminar_invite"
+    )
 
     class Config:
         env_file = ".env"
