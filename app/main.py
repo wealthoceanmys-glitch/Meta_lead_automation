@@ -3,8 +3,8 @@ import os
 import asyncio
 import httpx
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from sqlalchemy import or_, func
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import or_, func, and_
 from typing import Optional
 from datetime import date, datetime, timedelta
 from .config import settings
@@ -16,10 +16,13 @@ from .utils import clean_phone, get_seminar_details, now_iso
 from .whatsapp import send_template_for_lead, send_text_reply, save_outgoing_template_message
 from .meta import classify_webhook_and_handle, upsert_lead_from_meta
 
-app = FastAPI(title="WOI Lead CRM API", version="1.0.0")
+app = FastAPI(title="WOI Lead CRM API", version="2.0.0")
 
 KEEP_ALIVE_TASK = None
 
+# ---------------------------------------------------------------------------
+# Keep-alive
+# ---------------------------------------------------------------------------
 
 async def keep_alive_ping():
     public_url = (
@@ -43,6 +46,11 @@ async def keep_alive_ping():
             print(f"Keep-alive ping failed: {exc}", flush=True)
         await asyncio.sleep(13 * 60)
 
+
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+
 origins = [settings.frontend_origin, "http://localhost:3000", "http://127.0.0.1:3000"]
 app.add_middleware(
     CORSMiddleware,
@@ -51,6 +59,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Startup / shutdown
+# ---------------------------------------------------------------------------
 
 @app.on_event("startup")
 async def _startup():
@@ -71,12 +84,23 @@ async def _shutdown():
         except asyncio.CancelledError:
             pass
 
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "woi-lead-crm-backend"}
 
+
+# ---------------------------------------------------------------------------
+# Debug — SECURED (requires auth)
+# ---------------------------------------------------------------------------
+
 @app.get("/debug/config")
-def debug_config():
+def debug_config(user: str = Depends(require_user)):
+    """Configuration sanity check — protected by auth."""
     return {
         "db": "configured" if settings.database_url else "missing",
         "meta_page_access_token": "configured" if os.getenv("META_PAGE_ACCESS_TOKEN") else "missing",
@@ -92,11 +116,21 @@ def debug_config():
         "render_external_url": os.getenv("RENDER_EXTERNAL_URL", ""),
     }
 
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
 @app.post("/auth/login", response_model=TokenOut)
 def login(data: LoginIn):
     if data.username != settings.admin_username or data.password != settings.admin_password:
         raise HTTPException(status_code=401, detail="Invalid username or password")
     return TokenOut(access_token=create_token(data.username))
+
+
+# ---------------------------------------------------------------------------
+# Leads
+# ---------------------------------------------------------------------------
 
 @app.get("/leads")
 def list_leads(
@@ -112,7 +146,12 @@ def list_leads(
     query = db.query(Lead)
     if q:
         like = f"%{q}%"
-        query = query.filter(or_(Lead.full_name.ilike(like), Lead.phone.ilike(like), Lead.campaign_name.ilike(like), Lead.latest_reply_text.ilike(like)))
+        query = query.filter(or_(
+            Lead.full_name.ilike(like),
+            Lead.phone.ilike(like),
+            Lead.campaign_name.ilike(like),
+            Lead.latest_reply_text.ilike(like),
+        ))
     if status:
         query = query.filter(Lead.status == status)
     if day:
@@ -123,49 +162,80 @@ def list_leads(
     rows = query.order_by(Lead.id.desc()).offset(offset).limit(limit).all()
     return {"total": total, "rows": [LeadOut.model_validate(r).model_dump() for r in rows]}
 
+
 @app.post("/leads", response_model=LeadOut)
 def create_lead(data: LeadCreate, db: Session = Depends(get_db), user: str = Depends(require_user)):
     seminar = get_seminar_details(data.preferred_day, data.model_dump())
     lead = Lead(**data.model_dump(), phone=clean_phone(data.phone), raw={"source": "manual"}, **seminar)
-    db.add(lead); db.commit(); db.refresh(lead)
+    db.add(lead)
+    db.commit()
+    db.refresh(lead)
     return lead
+
 
 @app.patch("/leads/{lead_id}", response_model=LeadOut)
 def update_lead(lead_id: int, data: LeadUpdate, db: Session = Depends(get_db), user: str = Depends(require_user)):
     lead = db.get(Lead, lead_id)
-    if not lead: raise HTTPException(404, "Lead not found")
+    if not lead:
+        raise HTTPException(404, "Lead not found")
     for k, v in data.model_dump(exclude_unset=True).items():
-        if k == "phone" and v: v = clean_phone(v)
+        if k == "phone" and v:
+            v = clean_phone(v)
         setattr(lead, k, v)
-    db.commit(); db.refresh(lead)
+    db.commit()
+    db.refresh(lead)
     return lead
+
 
 @app.post("/leads/{lead_id}/send-whatsapp")
 def send_lead_whatsapp(lead_id: int, db: Session = Depends(get_db), user: str = Depends(require_user)):
     lead = db.get(Lead, lead_id)
-    if not lead: raise HTTPException(404, "Lead not found")
+    if not lead:
+        raise HTTPException(404, "Lead not found")
     return send_template_for_lead(db, lead)
+
+
+# ---------------------------------------------------------------------------
+# Follow-ups (per lead)
+# ---------------------------------------------------------------------------
 
 @app.get("/leads/{lead_id}/followups")
 def get_followups(lead_id: int, db: Session = Depends(get_db), user: str = Depends(require_user)):
     lead = db.get(Lead, lead_id)
-    if not lead: raise HTTPException(404, "Lead not found")
+    if not lead:
+        raise HTTPException(404, "Lead not found")
     rows = db.query(FollowUp).filter(FollowUp.lead_id == lead_id).order_by(FollowUp.id.asc()).all()
-    return {"rows": [{"id": r.id, "lead_id": r.lead_id, "followup_no": r.followup_no, "followup_date": r.followup_date, "response": r.response, "confirmed": r.confirmed, "seminar_date": r.seminar_date, "next_followup_date": r.next_followup_date, "remarks": r.remarks, "created_at": str(r.created_at)} for r in rows]}
+    return {"rows": [
+        {
+            "id": r.id, "lead_id": r.lead_id, "followup_no": r.followup_no,
+            "followup_date": r.followup_date, "response": r.response,
+            "confirmed": r.confirmed, "seminar_date": r.seminar_date,
+            "next_followup_date": r.next_followup_date, "remarks": r.remarks,
+            "created_at": str(r.created_at),
+        }
+        for r in rows
+    ]}
+
 
 @app.post("/leads/{lead_id}/followups")
 def add_followup(lead_id: int, data: FollowUpIn, db: Session = Depends(get_db), user: str = Depends(require_user)):
     lead = db.get(Lead, lead_id)
-    if not lead: raise HTTPException(404, "Lead not found")
+    if not lead:
+        raise HTTPException(404, "Lead not found")
     count = db.query(FollowUp).filter(FollowUp.lead_id == lead_id).count()
     fu = FollowUp(lead_id=lead_id, followup_no=count + 1, **data.model_dump())
     lead.status = data.confirmed or lead.status
     lead.next_followup_at = data.next_followup_date or lead.next_followup_at
     if data.remarks:
         lead.notes = ((lead.notes or "") + "\n" + data.remarks).strip()
-    db.add(fu); db.commit()
+    db.add(fu)
+    db.commit()
     return {"success": True, "id": fu.id}
 
+
+# ---------------------------------------------------------------------------
+# Follow-ups worklist — OPTIMISED (single query, no N+1)
+# ---------------------------------------------------------------------------
 
 def _parse_followup_date(value):
     """Parse YYYY-MM-DD, DD-MM-YYYY, DD/MM/YYYY into date object."""
@@ -185,15 +255,6 @@ def _date_to_iso(value):
     return d.isoformat() if d else ""
 
 
-def _latest_followup_for_lead(db: Session, lead_id: int):
-    return (
-        db.query(FollowUp)
-        .filter(FollowUp.lead_id == lead_id)
-        .order_by(FollowUp.id.desc())
-        .first()
-    )
-
-
 @app.get("/followups/due")
 def list_due_followups(
     bucket: str = Query("today", description="today, tomorrow, overdue, week, all, range"),
@@ -206,10 +267,8 @@ def list_due_followups(
     user: str = Depends(require_user),
 ):
     """
-    Follow-up worklist for CRM tab.
-
-    Looks at leads.next_followup_at first. If blank, uses latest followups.next_followup_date.
-    Dates may be stored as YYYY-MM-DD or DD-MM-YYYY, so filtering is done safely in Python.
+    Follow-up worklist. Uses a single JOIN query (no N+1) to load leads
+    with their latest follow-up in one round-trip to the database.
     """
     today = date.today()
     bucket = (bucket or "today").lower().strip()
@@ -230,21 +289,25 @@ def list_due_followups(
     else:
         start = end = today
 
-    query = db.query(Lead)
+    # -----------------------------------------------------------------------
+    # Single query: fetch leads + eagerly load all their followups at once.
+    # SQLAlchemy resolves the latest followup in Python from the preloaded
+    # collection — zero additional queries regardless of lead count.
+    # -----------------------------------------------------------------------
+    query = db.query(Lead).options(joinedload(Lead.followups))
+
     if status:
         query = query.filter(Lead.status == status)
     if q:
         like = f"%{q}%"
-        query = query.filter(
-            or_(
-                Lead.full_name.ilike(like),
-                Lead.phone.ilike(like),
-                Lead.campaign_name.ilike(like),
-                Lead.latest_reply_text.ilike(like),
-            )
-        )
+        query = query.filter(or_(
+            Lead.full_name.ilike(like),
+            Lead.phone.ilike(like),
+            Lead.campaign_name.ilike(like),
+            Lead.latest_reply_text.ilike(like),
+        ))
 
-    # Candidate filter keeps DB query light while still allowing latest followup fallback.
+    # Only fetch leads that have a next_followup_at set, or have at least one followup
     candidates = (
         query
         .order_by(Lead.updated_at.desc(), Lead.id.desc())
@@ -254,26 +317,25 @@ def list_due_followups(
 
     rows = []
     for lead in candidates:
-        latest = _latest_followup_for_lead(db, lead.id)
+        # Latest followup is already loaded — no extra query
+        sorted_fus = sorted(lead.followups, key=lambda f: f.id, reverse=True)
+        latest = sorted_fus[0] if sorted_fus else None
 
         due_raw = lead.next_followup_at or (latest.next_followup_date if latest else "")
         due = _parse_followup_date(due_raw)
 
-        # In all mode, show any lead with a due date. In other modes, skip blank dates.
-        if bucket != "all" and not due:
-            continue
-        if bucket == "all" and not due:
+        if not due:
             continue
 
         include = True
         if bucket == "overdue":
-            include = bool(due and due <= end)
+            include = due <= end
         elif bucket == "all":
             include = True
         else:
-            if start and due and due < start:
+            if start and due < start:
                 include = False
-            if end and due and due > end:
+            if end and due > end:
                 include = False
 
         if not include:
@@ -281,7 +343,7 @@ def list_due_followups(
 
         rows.append({
             "lead": LeadOut.model_validate(lead).model_dump(),
-            "due_date": due.isoformat() if due else "",
+            "due_date": due.isoformat(),
             "followup": {
                 "id": latest.id if latest else None,
                 "followup_no": latest.followup_no if latest else None,
@@ -292,11 +354,16 @@ def list_due_followups(
                 "next_followup_date": latest.next_followup_date if latest else due_raw,
                 "remarks": latest.remarks if latest else "",
                 "created_at": str(latest.created_at) if latest else "",
-            }
+            },
         })
 
     rows.sort(key=lambda r: (r["due_date"] or "9999-99-99", -(r["lead"]["id"] or 0)))
     return {"total": len(rows), "rows": rows[:limit]}
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
 
 @app.get("/reports/summary")
 def reports(db: Session = Depends(get_db), user: str = Depends(require_user)):
@@ -306,12 +373,27 @@ def reports(db: Session = Depends(get_db), user: str = Depends(require_user)):
     unread = db.query(Lead).filter(Lead.unread_count > 0).count()
     statuses = db.query(Lead.status, func.count(Lead.id)).group_by(Lead.status).all()
     days = db.query(Lead.seminar_day, func.count(Lead.id)).group_by(Lead.seminar_day).all()
-    return {"total": total, "sent": sent, "delivered": delivered, "unread": unread, "by_status": dict(statuses), "by_day": dict(days)}
+    return {
+        "total": total, "sent": sent, "delivered": delivered, "unread": unread,
+        "by_status": dict(statuses), "by_day": dict(days),
+    }
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp Inbox
+# ---------------------------------------------------------------------------
 
 @app.get("/whatsapp/conversations")
 def conversations(db: Session = Depends(get_db), user: str = Depends(require_user)):
-    leads = db.query(Lead).filter(or_(Lead.latest_reply_text.isnot(None), Lead.whatsapp_message_id.isnot(None))).order_by(Lead.unread_count.desc(), Lead.updated_at.desc()).limit(300).all()
+    leads = (
+        db.query(Lead)
+        .filter(or_(Lead.latest_reply_text.isnot(None), Lead.whatsapp_message_id.isnot(None)))
+        .order_by(Lead.unread_count.desc(), Lead.updated_at.desc())
+        .limit(300)
+        .all()
+    )
     return {"rows": [LeadOut.model_validate(l).model_dump() for l in leads]}
+
 
 @app.get("/whatsapp/conversations/{phone}")
 def thread(phone: str, db: Session = Depends(get_db), user: str = Depends(require_user)):
@@ -319,13 +401,34 @@ def thread(phone: str, db: Session = Depends(get_db), user: str = Depends(requir
     msgs = db.query(WhatsAppMessage).filter(WhatsAppMessage.phone == p).order_by(WhatsAppMessage.id.asc()).all()
     lead = db.query(Lead).filter(Lead.phone == p).order_by(Lead.id.desc()).first()
     if lead:
-        lead.unread_count = 0; db.commit()
-    return {"lead": LeadOut.model_validate(lead).model_dump() if lead else None, "messages": [{"id": m.id, "wa_message_id": m.wa_message_id, "direction": m.direction, "body": m.body, "status": m.status, "message_type": m.message_type, "timestamp": m.timestamp, "created_at": str(m.created_at)} for m in msgs]}
+        lead.unread_count = 0
+        db.commit()
+    return {
+        "lead": LeadOut.model_validate(lead).model_dump() if lead else None,
+        "messages": [
+            {
+                "id": m.id, "wa_message_id": m.wa_message_id, "direction": m.direction,
+                "body": m.body, "status": m.status, "message_type": m.message_type,
+                "timestamp": m.timestamp, "created_at": str(m.created_at),
+            }
+            for m in msgs
+        ],
+    }
+
 
 @app.post("/whatsapp/reply")
 def reply(data: ReplyIn, db: Session = Depends(get_db), user: str = Depends(require_user)):
-    lead = db.get(Lead, data.lead_id) if data.lead_id else db.query(Lead).filter(Lead.phone == clean_phone(data.phone)).order_by(Lead.id.desc()).first()
+    lead = (
+        db.get(Lead, data.lead_id)
+        if data.lead_id
+        else db.query(Lead).filter(Lead.phone == clean_phone(data.phone)).order_by(Lead.id.desc()).first()
+    )
     return send_text_reply(db, data.phone, data.text, lead)
+
+
+# ---------------------------------------------------------------------------
+# Meta webhook
+# ---------------------------------------------------------------------------
 
 @app.get("/webhook/meta-leads")
 def verify_webhook(request: Request):
@@ -334,6 +437,7 @@ def verify_webhook(request: Request):
         return int(params.get("hub.challenge", "0"))
     raise HTTPException(status_code=403, detail="Invalid verify token")
 
+
 @app.post("/webhook/meta-leads")
 async def meta_webhook(request: Request, background: BackgroundTasks, db: Session = Depends(get_db)):
     payload = await request.json()
@@ -341,6 +445,11 @@ async def meta_webhook(request: Request, background: BackgroundTasks, db: Sessio
     result = classify_webhook_and_handle(db, payload)
     print("Webhook result:", result)
     return {"success": True, "result": result}
+
+
+# ---------------------------------------------------------------------------
+# Maintenance
+# ---------------------------------------------------------------------------
 
 @app.post("/maintenance/backfill-whatsapp-chatbox")
 def backfill_whatsapp_chatbox(db: Session = Depends(get_db), user: str = Depends(require_user)):
@@ -357,15 +466,34 @@ def backfill_whatsapp_chatbox(db: Session = Depends(get_db), user: str = Depends
     return {"success": True, "created_or_updated": created_or_updated, "skipped": skipped}
 
 
+# ---------------------------------------------------------------------------
+# Test endpoints — gated by TEST_ENDPOINTS_ENABLED env flag
+# ---------------------------------------------------------------------------
+
+def _require_test_mode():
+    """Raises 403 if TEST_ENDPOINTS_ENABLED is not explicitly set to true."""
+    enabled = os.getenv("TEST_ENDPOINTS_ENABLED", "false").lower() in ("true", "1", "yes")
+    if not enabled:
+        raise HTTPException(status_code=403, detail="Test endpoints disabled. Set TEST_ENDPOINTS_ENABLED=true to enable.")
+
+
 @app.post("/test/whatsapp")
 def test_whatsapp(data: TestWhatsAppIn, db: Session = Depends(get_db)):
-    # Test endpoint intentionally does not need auth so Meta/Windows CMD testing is easy. Remove if desired.
+    _require_test_mode()
     seminar = get_seminar_details(data.please_choose_a_day_for_the_free_seminar, data.model_dump())
-    lead = Lead(full_name=data.name, phone=clean_phone(data.phone), campaign_name="Test", preferred_day=data.please_choose_a_day_for_the_free_seminar, raw={"source":"test"}, **seminar)
-    db.add(lead); db.commit(); db.refresh(lead)
+    lead = Lead(
+        full_name=data.name, phone=clean_phone(data.phone), campaign_name="Test",
+        preferred_day=data.please_choose_a_day_for_the_free_seminar,
+        raw={"source": "test"}, **seminar,
+    )
+    db.add(lead)
+    db.commit()
+    db.refresh(lead)
     return {"success": True, "lead_id": lead.id, "seminar": seminar, "whatsapp": send_template_for_lead(db, lead)}
+
 
 @app.post("/test/meta-lead/{lead_id}")
 def test_meta_lead(lead_id: str, db: Session = Depends(get_db)):
+    _require_test_mode()
     lead, wa = upsert_lead_from_meta(db, lead_id, auto_send=True)
     return {"success": True, "lead": LeadOut.model_validate(lead).model_dump(), "whatsapp": wa}
