@@ -448,8 +448,11 @@ def reports(db: Session = Depends(get_db), user: str = Depends(require_user)):
     sent = db.query(Lead).filter(Lead.whatsapp_sent == True).count()
     delivered = db.query(Lead).filter(Lead.whatsapp_delivered == True).count()
     unread = db.query(Lead).filter(Lead.unread_count > 0).count()
-    statuses = db.query(Lead.status, func.count(Lead.id)).group_by(Lead.status).all()
-    days = db.query(Lead.seminar_day, func.count(Lead.id)).group_by(Lead.seminar_day).all()
+    from sqlalchemy import case as sa_case
+    # Normalise status case so 'new' and 'New' merge into one bucket
+    status_label = func.initcap(func.lower(Lead.status))
+    statuses = db.query(status_label, func.count(Lead.id)).group_by(status_label).all()
+    days = db.query(Lead.seminar_day, func.count(Lead.id)).filter(Lead.seminar_day.isnot(None), Lead.seminar_day != "").group_by(Lead.seminar_day).all()
     return {
         "total": total, "sent": sent, "delivered": delivered, "unread": unread,
         "by_status": dict(statuses), "by_day": dict(days),
