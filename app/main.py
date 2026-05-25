@@ -51,10 +51,19 @@ async def keep_alive_ping():
 # CORS
 # ---------------------------------------------------------------------------
 
-origins = [settings.frontend_origin, "http://localhost:3000", "http://127.0.0.1:3000"]
+# Build origins list — always include localhost + any Vercel preview URLs
+_origins = [
+    settings.frontend_origin,
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+# Filter out empty strings (in case FRONTEND_ORIGIN env var is not set)
+origins = [o for o in _origins if o]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(set(origins)),
+    allow_origins=origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",  # covers all Vercel preview URLs
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
