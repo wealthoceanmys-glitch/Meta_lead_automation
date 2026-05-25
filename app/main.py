@@ -138,13 +138,12 @@ def list_leads(
     status: str = "",
     day: str = "",
     unread: bool = False,
-    limit: int = Query(1000, ge=1, le=5000),
-    offset: int = Query(0, ge=0),
+    limit: int = Query(100, le=500),
+    offset: int = 0,
     db: Session = Depends(get_db),
     user: str = Depends(require_user),
 ):
     query = db.query(Lead)
-
     if q:
         like = f"%{q}%"
         query = query.filter(or_(
@@ -155,33 +154,17 @@ def list_leads(
             Lead.platform.ilike(like),
             Lead.latest_reply_text.ilike(like),
         ))
-
     if status:
         query = query.filter(Lead.status == status)
-
     if day:
         query = query.filter(Lead.seminar_day == day)
-
     if unread:
         query = query.filter(Lead.unread_count > 0)
-
     total = query.count()
+    rows = query.order_by(Lead.id.desc()).offset(offset).limit(limit).all()
+    return {"total": total, "rows": [LeadOut.model_validate(r).model_dump() for r in rows]}
 
-    rows = (
-        query
-        .order_by(Lead.id.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
 
-    return {
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "count": len(rows),
-        "rows": [LeadOut.model_validate(r).model_dump() for r in rows],
-    }
 @app.post("/leads", response_model=LeadOut)
 def create_lead(data: LeadCreate, db: Session = Depends(get_db), user: str = Depends(require_user)):
     payload = data.model_dump()
@@ -471,6 +454,95 @@ def reports(db: Session = Depends(get_db), user: str = Depends(require_user)):
         "total": total, "sent": sent, "delivered": delivered, "unread": unread,
         "by_status": dict(statuses), "by_day": dict(days),
     }
+
+
+@app.get("/reports/seminar")
+def reports_seminar(
+    date_from: str = None,
+    date_to: str = None,
+    db: Session = Depends(get_db),
+    user: str = Depends(require_user),
+):
+    """
+    Returns per-seminar-date breakdown with:
+      - total leads registered
+      - attended
+      - confirmed (will attend)
+      - call_picked   (any response that is NOT a call-not-picked variant)
+      - call_not_picked
+      - missed
+    Filtered by seminar_date text range (parsed as DD Month YYYY).
+
+    Query params:
+      date_from / date_to  -- ISO dates YYYY-MM-DD, inclusive
+    """
+    from datetime import date as _date, datetime as _dt
+    import re as _re
+
+    # Fetch every lead that has a seminar_date set
+    q = db.query(Lead).filter(Lead.seminar_date.isnot(None), Lead.seminar_date != "")
+    all_leads = q.all()
+
+    def parse_seminar_date(s):
+        """Parse 'Thursday, 28 May 2026' -> date object, or None."""
+        try:
+            # strip weekday prefix if present
+            parts = s.split(", ", 1)
+            date_part = parts[-1].strip()
+            return _dt.strptime(date_part, "%d %B %Y").date()
+        except Exception:
+            return None
+
+    # Parse filter bounds
+    from_date = _dt.strptime(date_from, "%Y-%m-%d").date() if date_from else None
+    to_date   = _dt.strptime(date_to,   "%Y-%m-%d").date() if date_to   else None
+
+    # Group leads by seminar_date string
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for lead in all_leads:
+        d = parse_seminar_date(lead.seminar_date)
+        if d is None:
+            continue
+        if from_date and d < from_date:
+            continue
+        if to_date and d > to_date:
+            continue
+        buckets[lead.seminar_date].append(lead)
+
+    NOT_PICKED_KEYWORDS = [
+        "not picked", "switched off", "not reachable", "wrong number",
+    ]
+
+    def is_not_picked(response):
+        if not response:
+            return False
+        r = response.lower()
+        return any(k in r for k in NOT_PICKED_KEYWORDS)
+
+    rows = []
+    for seminar_date_str, leads in sorted(
+        buckets.items(),
+        key=lambda x: parse_seminar_date(x[0]) or _date.min
+    ):
+        total        = len(leads)
+        attended     = sum(1 for l in leads if (l.confirmed or "").lower() == "attended")
+        confirmed    = sum(1 for l in leads if (l.confirmed or "").lower() == "confirmed")
+        missed       = sum(1 for l in leads if (l.confirmed or "").lower() == "missed")
+        call_np      = sum(1 for l in leads if is_not_picked(l.response))
+        call_picked  = sum(1 for l in leads if l.response and not is_not_picked(l.response))
+
+        rows.append({
+            "seminar_date":   seminar_date_str,
+            "total":          total,
+            "attended":       attended,
+            "confirmed":      confirmed,
+            "missed":         missed,
+            "call_picked":    call_picked,
+            "call_not_picked":call_np,
+        })
+
+    return {"rows": rows}
 
 
 # ---------------------------------------------------------------------------
