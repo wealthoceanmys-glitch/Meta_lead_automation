@@ -138,12 +138,13 @@ def list_leads(
     status: str = "",
     day: str = "",
     unread: bool = False,
-    limit: int = Query(100, le=500),
-    offset: int = 0,
+    limit: int = Query(1000, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: str = Depends(require_user),
 ):
     query = db.query(Lead)
+
     if q:
         like = f"%{q}%"
         query = query.filter(or_(
@@ -154,17 +155,33 @@ def list_leads(
             Lead.platform.ilike(like),
             Lead.latest_reply_text.ilike(like),
         ))
+
     if status:
         query = query.filter(Lead.status == status)
+
     if day:
         query = query.filter(Lead.seminar_day == day)
+
     if unread:
         query = query.filter(Lead.unread_count > 0)
+
     total = query.count()
-    rows = query.order_by(Lead.id.desc()).offset(offset).limit(limit).all()
-    return {"total": total, "rows": [LeadOut.model_validate(r).model_dump() for r in rows]}
 
+    rows = (
+        query
+        .order_by(Lead.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
 
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "count": len(rows),
+        "rows": [LeadOut.model_validate(r).model_dump() for r in rows],
+    }
 @app.post("/leads", response_model=LeadOut)
 def create_lead(data: LeadCreate, db: Session = Depends(get_db), user: str = Depends(require_user)):
     payload = data.model_dump()
