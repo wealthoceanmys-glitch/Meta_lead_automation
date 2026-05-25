@@ -213,7 +213,11 @@ def upsert_lead_from_meta(db: Session, lead_id: str, raw: dict | None = None, au
         value = data.get(k)
         if k == "platform":
             value = normalize_source(value)
-        setattr(lead, k, value or getattr(lead, k))
+        # Always write if we have a fresh value — never skip when DB already has one.
+        # This ensures campaign_name/form_name are updated on re-fetch.
+        if value:
+            setattr(lead, k, value)
+        # If no new value, preserve existing DB value (don't blank it out).
 
     lead.raw = merged
 
