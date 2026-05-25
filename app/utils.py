@@ -101,7 +101,15 @@ def next_weekday_date(now, target_weekday, event_start):
 def get_seminar_details(preferred_day: str = "", data: dict | None = None):
     tz = ZoneInfo(settings.seminar_timezone)
     now = datetime.now(tz)
-    pref = (preferred_day or detect_preferred_day(data or {})).lower()
+
+    # Meta form sends values like "Sunday, 10AM" or "Thursday, 6PM" — not bare day names.
+    # Normalize: extract just the day word so the schedules dict lookup works correctly.
+    raw_pref = (preferred_day or detect_preferred_day(data or {})).strip()
+    if raw_pref:
+        # detect_preferred_day already handles keyword extraction; apply it to the raw value too
+        pref = detect_preferred_day({"__val__": raw_pref}).lower() or raw_pref.lower()
+    else:
+        pref = ""
 
     schedules = {
         "thursday": {
