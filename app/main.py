@@ -137,12 +137,16 @@ def list_leads(
     q: str = "",
     status: str = "",
     day: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    sort: str = "latest",
     unread: bool = False,
-    limit: int = Query(100, le=500),
+    limit: int = Query(500, le=5000),
     offset: int = 0,
     db: Session = Depends(get_db),
     user: str = Depends(require_user),
 ):
+    from datetime import datetime as _dt
     query = db.query(Lead)
     if q:
         like = f"%{q}%"
@@ -160,8 +164,24 @@ def list_leads(
         query = query.filter(Lead.seminar_day == day)
     if unread:
         query = query.filter(Lead.unread_count > 0)
+    # Filter by lead created_time date range
+    if date_from:
+        try:
+            query = query.filter(Lead.created_time >= date_from)
+        except Exception:
+            pass
+    if date_to:
+        try:
+            query = query.filter(Lead.created_time <= date_to + "T23:59:59")
+        except Exception:
+            pass
     total = query.count()
-    rows = query.order_by(Lead.id.desc()).offset(offset).limit(limit).all()
+    # Sort order
+    if sort == "oldest":
+        query = query.order_by(Lead.id.asc())
+    else:
+        query = query.order_by(Lead.id.desc())
+    rows = query.offset(offset).limit(limit).all()
     return {"total": total, "rows": [LeadOut.model_validate(r).model_dump() for r in rows]}
 
 
