@@ -122,6 +122,8 @@ def enrich_ad_form_metadata(data: dict, webhook_value: dict | None = None):
 
     if data.get("ad_id"):
         ad = fetch_optional_object(data["ad_id"], "id,name,adset_id,campaign_id")
+        if not ad:
+            print(f"[WARN] Ad fetch returned empty for ad_id={data['ad_id']} — token may lack ads_read scope", flush=True)
         data["ad_name"] = data.get("ad_name") or ad.get("name", "")
         data["adset_id"] = _clean_meta_value(data.get("adset_id") or ad.get("adset_id", ""))
         data["campaign_id"] = _clean_meta_value(data.get("campaign_id") or ad.get("campaign_id", ""))
