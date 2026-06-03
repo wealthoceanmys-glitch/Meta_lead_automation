@@ -85,7 +85,7 @@ def fetch_lead_details(lead_id: str):
     Do NOT request ad_name/adset_name/campaign_name/form_name directly from Lead object.
     Meta rejects unsupported fields and then field_data becomes unavailable.
     """
-    safe_fields = "id,created_time,field_data,ad_id,form_id,is_organic,platform"
+    safe_fields = "id,created_time,field_data,ad_id,adset_id,campaign_id,form_id,is_organic,platform"
     return graph_get(lead_id, safe_fields, timeout=30)
 
 
