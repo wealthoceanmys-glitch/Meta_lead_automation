@@ -58,6 +58,8 @@ class LeadUpdate(BaseModel):
     owner: Optional[str] = None
     notes: Optional[str] = None
     next_followup_at: Optional[str] = None
+    campaign_name: Optional[str] = None   # ← ADD THIS
+    platform: Optional[str] = None        # ← ADD THIS too (same gap)
 
 class FollowUpIn(BaseModel):
     followup_date: str = ""
