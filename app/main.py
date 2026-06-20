@@ -236,7 +236,10 @@ def send_lead_whatsapp(lead_id: int, db: Session = Depends(get_db), user: str = 
     lead = db.get(Lead, lead_id)
     if not lead:
         raise HTTPException(404, "Lead not found")
-    return send_template_for_lead(db, lead)
+    # Manual "Send Invitation" — use invitation template and force=True so it
+    # always sends even if the auto registration message was already delivered,
+    # and a new outgoing WhatsAppMessage row is saved for the inbox.
+    return send_template_for_lead(db, lead, force=True, template_type="invitation")
 
 
 # ---------------------------------------------------------------------------
@@ -639,10 +642,13 @@ def reports_seminar(
 
 @app.get("/whatsapp/conversations")
 def conversations(db: Session = Depends(get_db), user: str = Depends(require_user)):
+    # Order purely by most recent activity (newest first) so the list is stable
+    # and chronological. Do NOT sort by unread_count — that makes chats jump
+    # to the top whenever a new reply arrives.
     leads = (
         db.query(Lead)
         .filter(or_(Lead.latest_reply_text.isnot(None), Lead.whatsapp_message_id.isnot(None)))
-        .order_by(Lead.unread_count.desc(), Lead.updated_at.desc())
+        .order_by(Lead.updated_at.desc(), Lead.id.desc())
         .limit(300)
         .all()
     )
