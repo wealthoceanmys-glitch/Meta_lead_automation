@@ -120,10 +120,21 @@ def enrich_ad_form_metadata(data: dict, webhook_value: dict | None = None):
     )
     data["platform"] = normalize_source(source)
 
+    # --- Step 1: Resolve form name (works with leads_retrieval scope only) ---
+    # Do this FIRST so form_name is available as a campaign_name fallback below.
+    if data.get("form_id"):
+        form = fetch_optional_object(data["form_id"], "id,name,page{id,name}")
+        data["form_name"] = data.get("form_name") or form.get("name", "")
+
+    # --- Step 2: Resolve ad → adset → campaign chain (requires ads_read scope) ---
     if data.get("ad_id"):
         ad = fetch_optional_object(data["ad_id"], "id,name,adset_id,campaign_id")
         if not ad:
-            print(f"[WARN] Ad fetch returned empty for ad_id={data['ad_id']} — token may lack ads_read scope", flush=True)
+            print(
+                f"[WARN] Ad fetch returned empty for ad_id={data['ad_id']} — "
+                "token may lack ads_read scope. campaign_name will fall back to form_name.",
+                flush=True,
+            )
         data["ad_name"] = data.get("ad_name") or ad.get("name", "")
         data["adset_id"] = _clean_meta_value(data.get("adset_id") or ad.get("adset_id", ""))
         data["campaign_id"] = _clean_meta_value(data.get("campaign_id") or ad.get("campaign_id", ""))
@@ -137,9 +148,15 @@ def enrich_ad_form_metadata(data: dict, webhook_value: dict | None = None):
         campaign = fetch_optional_object(data["campaign_id"], "id,name")
         data["campaign_name"] = data.get("campaign_name") or campaign.get("name", "")
 
-    if data.get("form_id"):
-        form = fetch_optional_object(data["form_id"], "id,name")
-        data["form_name"] = data.get("form_name") or form.get("name", "")
+    # --- Step 3: Fallback — use form name as campaign_name when ads_read is unavailable ---
+    # The leadgen form name (e.g. "WOI Free Seminar - FB June") is a reliable
+    # identifier even when the token cannot resolve the campaign hierarchy.
+    if not data.get("campaign_name") and data.get("form_name"):
+        data["campaign_name"] = data["form_name"]
+        print(
+            f"[INFO] campaign_name not resolved via ad chain — using form_name as fallback: {data['form_name']}",
+            flush=True,
+        )
 
     return data
 
