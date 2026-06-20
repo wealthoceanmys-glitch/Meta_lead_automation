@@ -642,17 +642,56 @@ def reports_seminar(
 
 @app.get("/whatsapp/conversations")
 def conversations(db: Session = Depends(get_db), user: str = Depends(require_user)):
-    # Order purely by most recent activity (newest first) so the list is stable
-    # and chronological. Do NOT sort by unread_count — that makes chats jump
-    # to the top whenever a new reply arrives.
+    # Build a per-phone "last activity" map from the actual message table.
+    # This is the TRUE chronological signal — unlike Lead.updated_at, which
+    # changes on any row edit (e.g. resetting unread_count when a chat is
+    # opened) and would make chats jump to the top without a new message.
     leads = (
         db.query(Lead)
         .filter(or_(Lead.latest_reply_text.isnot(None), Lead.whatsapp_message_id.isnot(None)))
-        .order_by(Lead.updated_at.desc(), Lead.id.desc())
         .limit(300)
         .all()
     )
-    return {"rows": [LeadOut.model_validate(l).model_dump() for l in leads]}
+
+    # Latest message timestamp per phone (max id = most recent inserted message)
+    last_msg = (
+        db.query(
+            WhatsAppMessage.phone,
+            func.max(WhatsAppMessage.id).label("max_id"),
+        )
+        .group_by(WhatsAppMessage.phone)
+        .all()
+    )
+    last_id_by_phone = {clean_phone(p): mid for (p, mid) in last_msg}
+
+    # Also fetch the actual timestamp of each phone's latest message for display
+    latest_ts_by_phone = {}
+    if last_id_by_phone:
+        max_ids = list(last_id_by_phone.values())
+        ts_rows = (
+            db.query(WhatsAppMessage.phone, WhatsAppMessage.timestamp, WhatsAppMessage.created_at)
+            .filter(WhatsAppMessage.id.in_(max_ids))
+            .all()
+        )
+        for ph, ts, ca in ts_rows:
+            latest_ts_by_phone[clean_phone(ph)] = ts or (str(ca) if ca else None)
+
+    def activity_key(l):
+        # Prefer the newest message row id (monotonic, insertion-ordered).
+        mid = last_id_by_phone.get(clean_phone(l.phone or ""), 0) or 0
+        return mid
+
+    leads.sort(key=activity_key, reverse=True)
+
+    rows = []
+    for l in leads:
+        d = LeadOut.model_validate(l).model_dump()
+        ph = clean_phone(l.phone or "")
+        # last_activity_at = timestamp of the most recent message (in or out)
+        d["last_activity_at"] = latest_ts_by_phone.get(ph) or l.latest_reply_at or l.whatsapp_sent_at
+        rows.append(d)
+
+    return {"rows": rows}
 
 
 @app.get("/whatsapp/conversations/{phone}")
