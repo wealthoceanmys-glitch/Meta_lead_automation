@@ -35,6 +35,71 @@ def normalize_source(value):
     return text.upper()
 
 
+def _extract_incoming_text(m: dict, msg_type: str) -> str:
+    """Extract readable text from any WhatsApp incoming message type.
+
+    Handles text, button quick-replies, interactive (button/list) replies,
+    reactions, and media captions. Falls back gracefully for unknown types
+    instead of showing a bare [unsupported] label.
+    """
+    try:
+        if msg_type == "text":
+            return (m.get("text") or {}).get("body", "") or "[empty message]"
+
+        if msg_type == "button":
+            # Quick-reply button on a template
+            return (m.get("button") or {}).get("text", "") or "[button reply]"
+
+        if msg_type == "interactive":
+            inter = m.get("interactive") or {}
+            itype = inter.get("type", "")
+            if itype == "button_reply":
+                return (inter.get("button_reply") or {}).get("title", "") or "[button reply]"
+            if itype == "list_reply":
+                lr = inter.get("list_reply") or {}
+                return lr.get("title", "") or lr.get("description", "") or "[list reply]"
+            return "[interactive reply]"
+
+        if msg_type == "reaction":
+            emoji = (m.get("reaction") or {}).get("emoji", "")
+            return f"Reacted: {emoji}" if emoji else "[reaction]"
+
+        # Media types with optional captions
+        if msg_type in ("image", "video", "document", "audio", "sticker", "voice"):
+            caption = (m.get(msg_type) or {}).get("caption", "")
+            label = {
+                "image": "📷 Photo",
+                "video": "🎥 Video",
+                "document": "📄 Document",
+                "audio": "🎵 Audio",
+                "voice": "🎙️ Voice message",
+                "sticker": "Sticker",
+            }.get(msg_type, msg_type)
+            return f"{label}{(': ' + caption) if caption else ''}"
+
+        if msg_type == "location":
+            loc = m.get("location") or {}
+            nm = loc.get("name") or ""
+            return f"📍 Location{(': ' + nm) if nm else ''}"
+
+        if msg_type == "contacts":
+            return "👤 Contact card"
+
+        if msg_type == "unsupported":
+            # WhatsApp couldn't process the user's message format
+            errs = m.get("errors") or []
+            if errs:
+                title = errs[0].get("title", "") or errs[0].get("message", "")
+                return f"[Unsupported message{(': ' + title) if title else ''}]"
+            return "[Unsupported message type]"
+
+        # Any other / future type
+        return f"[{msg_type} message]"
+    except Exception as exc:
+        print(f"[WARN] Failed to extract incoming text for type={msg_type}: {exc}", flush=True)
+        return f"[{msg_type}]"
+
+
 def get_meta_token():
     """
     Keep compatibility with the old Sheets backend env names.
@@ -338,14 +403,7 @@ def handle_whatsapp_payload(db: Session, payload: dict):
                 phone = clean_phone(m.get("from"))
                 name = contacts.get(phone) or ""
                 msg_type = m.get("type", "unknown")
-                if msg_type == "text":
-                    text = (m.get("text") or {}).get("body", "")
-                elif msg_type == "button":
-                    text = (m.get("button") or {}).get("text", "")
-                elif msg_type == "interactive":
-                    text = str(m.get("interactive") or {})
-                else:
-                    text = f"[{msg_type}]"
+                text = _extract_incoming_text(m, msg_type)
                 lead = _find_or_create_lead_by_phone(db, phone, name)
                 lead.latest_reply_text = text
                 lead.latest_reply_at = now_iso()
