@@ -708,7 +708,8 @@ def thread(phone: str, db: Session = Depends(get_db), user: str = Depends(requir
             {
                 "id": m.id, "wa_message_id": m.wa_message_id, "direction": m.direction,
                 "body": m.body, "status": m.status, "message_type": m.message_type,
-                "timestamp": m.timestamp, "created_at": str(m.created_at),
+                "timestamp": m.timestamp or (str(m.created_at) if m.created_at else None),
+                "created_at": str(m.created_at) if m.created_at else None,
             }
             for m in msgs
         ],
