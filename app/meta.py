@@ -147,10 +147,15 @@ def graph_get(object_id: str, fields: str, timeout: int = 25):
 def fetch_lead_details(lead_id: str):
     """
     Fetch only safe Lead object fields first.
-    Do NOT request ad_name/adset_name/campaign_name/form_name directly from Lead object.
-    Meta rejects unsupported fields and then field_data becomes unavailable.
+
+    CRITICAL: The leadgen object only supports a limited set of fields. It does
+    NOT support `adset_id` or `campaign_id` directly — requesting them makes Meta
+    reject the ENTIRE call, so field_data/ad_id/form_id all come back empty.
+    adset_id and campaign_id are resolved separately from the AD object in
+    enrich_ad_form_metadata(). Only request fields the leadgen object actually
+    supports: id, created_time, field_data, ad_id, form_id, is_organic, platform.
     """
-    safe_fields = "id,created_time,field_data,ad_id,adset_id,campaign_id,form_id,is_organic,platform"
+    safe_fields = "id,created_time,field_data,ad_id,form_id,is_organic,platform"
     return graph_get(lead_id, safe_fields, timeout=30)
 
 
@@ -187,13 +192,13 @@ def enrich_ad_form_metadata(data: dict, webhook_value: dict | None = None):
 
     # --- Step 1: Resolve form name (works with leads_retrieval scope only) ---
     # Do this FIRST so form_name is available as a campaign_name fallback below.
+    # Use only "id,name" like the old working Sheets code — a nested page{} field
+    # can make the call fail if the token lacks page-read on the form.
     if data.get("form_id"):
-        form = fetch_optional_object(data["form_id"], "id,name,page{id,name}")
+        form = fetch_optional_object(data["form_id"], "id,name")
         if not form:
             print(
-                f"[WARN] Form fetch returned empty for form_id={data['form_id']} — "
-                "token may lack leads_retrieval/pages permission, or form is on a different page. "
-                "campaign_name will be empty.",
+                f"[WARN] Form fetch returned empty for form_id={data['form_id']}",
                 flush=True,
             )
         data["form_name"] = data.get("form_name") or form.get("name", "")
@@ -226,15 +231,34 @@ def enrich_ad_form_metadata(data: dict, webhook_value: dict | None = None):
         campaign = fetch_optional_object(data["campaign_id"], "id,name")
         data["campaign_name"] = data.get("campaign_name") or campaign.get("name", "")
 
-    # --- Step 3: Fallback — use form name as campaign_name when ads_read is unavailable ---
-    # The leadgen form name (e.g. "WOI Free Seminar - FB June") is a reliable
-    # identifier even when the token cannot resolve the campaign hierarchy.
-    if not data.get("campaign_name") and data.get("form_name"):
-        data["campaign_name"] = data["form_name"]
-        print(
-            f"[INFO] campaign_name not resolved via ad chain — using form_name as fallback: {data['form_name']}",
-            flush=True,
+    # --- Step 3: Layered fallback for campaign_name ---
+    # When the ad → campaign chain can't be resolved (token lacks ads_read or is
+    # expired), fall back to the most specific identifier we DID manage to get,
+    # in priority order: adset_name → ad_name → form_name. Each of these still
+    # tells you which campaign/audience a lead came from. This is critical when
+    # running multiple campaigns simultaneously.
+    if not data.get("campaign_name"):
+        fallback = (
+            data.get("adset_name")
+            or data.get("ad_name")
+            or data.get("form_name")
         )
+        if fallback:
+            data["campaign_name"] = fallback
+            print(
+                f"[INFO] campaign_name not resolved via campaign object — using "
+                f"fallback identifier: {fallback!r}",
+                flush=True,
+            )
+        else:
+            # Absolute last resort: surface the raw adset_id so leads from
+            # different ad sets are at least visually distinguishable.
+            if data.get("adset_id"):
+                data["campaign_name"] = f"Ad Set {data['adset_id']}"
+                print(
+                    f"[INFO] No names resolved — using raw adset_id as label: {data['adset_id']}",
+                    flush=True,
+                )
 
     return data
 
