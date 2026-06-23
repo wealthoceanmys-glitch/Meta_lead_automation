@@ -189,7 +189,20 @@ def enrich_ad_form_metadata(data: dict, webhook_value: dict | None = None):
     # Do this FIRST so form_name is available as a campaign_name fallback below.
     if data.get("form_id"):
         form = fetch_optional_object(data["form_id"], "id,name,page{id,name}")
+        if not form:
+            print(
+                f"[WARN] Form fetch returned empty for form_id={data['form_id']} — "
+                "token may lack leads_retrieval/pages permission, or form is on a different page. "
+                "campaign_name will be empty.",
+                flush=True,
+            )
         data["form_name"] = data.get("form_name") or form.get("name", "")
+    else:
+        print(
+            "[WARN] No form_id present on lead — webhook and lead object both missing it. "
+            f"ad_id={data.get('ad_id')!r} campaign_id={data.get('campaign_id')!r}",
+            flush=True,
+        )
 
     # --- Step 2: Resolve ad → adset → campaign chain (requires ads_read scope) ---
     if data.get("ad_id"):
