@@ -32,6 +32,7 @@ class LeadOut(BaseModel):
     latest_reply_text: Optional[str] = None
     latest_reply_at: Optional[str] = None
     unread_count: int = 0
+    created_at: Optional[Any] = None
     class Config:
         from_attributes = True
 
