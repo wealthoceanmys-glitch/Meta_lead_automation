@@ -26,6 +26,7 @@ from .config import settings
 from .db import get_db
 from .models import WhatsAppTemplate, WhatsAppMessage
 from .utils import now_iso, clean_phone
+from .whatsapp_status import extract_status_error
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/templates", tags=["templates"])
@@ -576,7 +577,90 @@ def send_bulk(
     db.commit()
 
     sent = sum(1 for r in results if r["ok"])
-    return {"total": len(results), "sent": sent, "failed": len(results) - sent, "results": results}
+    # wamids lets the frontend poll /message-status for live delivery counts
+    wamids = [r["wamid"] for r in results if r.get("wamid")]
+    return {
+        "total": len(results),
+        "sent": sent,
+        "failed": len(results) - sent,
+        "results": results,
+        "wamids": wamids,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# Delivery status polling (live counts after a bulk send)
+# ─────────────────────────────────────────────────────────────
+
+class MessageStatusIn(BaseModel):
+    wamids: List[str]
+
+
+# Terminal states — once every message is in one of these, the frontend can stop polling.
+_TERMINAL_STATES = {"read", "failed"}
+
+
+@router.post("/message-status")
+def message_status(
+    data: MessageStatusIn,
+    db: Session = Depends(get_db),
+    user: str = Depends(require_user),
+):
+    """
+    Given the wa_message_ids returned by /send-bulk, return each message's current
+    delivery status plus aggregate counts. The frontend polls this after a bulk send
+    to render live Sent / Delivered / Read / Failed counts.
+
+    Statuses are updated asynchronously by the webhook handler (whatsapp_status.apply_status_updates)
+    as Meta delivers status callbacks. Until a callback arrives a message stays "accepted".
+    """
+    wamids = [w for w in (data.wamids or []) if w]
+    if not wamids:
+        return {"total": 0, "counts": {}, "statuses": {}, "delivered_total": 0, "all_terminal": True}
+
+    rows = (
+        db.query(WhatsAppMessage)
+        .filter(WhatsAppMessage.wa_message_id.in_(wamids))
+        .all()
+    )
+    by_id = {row.wa_message_id: row for row in rows}
+
+    counts = {"accepted": 0, "sent": 0, "delivered": 0, "read": 0, "failed": 0, "pending": 0}
+    statuses = {}
+    all_terminal = True
+
+    for wamid in wamids:
+        row = by_id.get(wamid)
+        if not row:
+            # Send record not committed yet (rare race) — treat as pending
+            statuses[wamid] = {"status": "pending", "error_code": None, "error_title": None}
+            counts["pending"] += 1
+            all_terminal = False
+            continue
+
+        st = (row.status or "accepted").lower()
+        if st not in counts:
+            st = "accepted"
+
+        err_code = err_title = None
+        if st == "failed":
+            err_code, err_title = extract_status_error(row.raw)
+
+        statuses[wamid] = {"status": st, "error_code": err_code, "error_title": err_title}
+        counts[st] += 1
+        if st not in _TERMINAL_STATES:
+            all_terminal = False
+
+    # A read message is also delivered — show a combined "delivered or better" total.
+    delivered_total = counts["delivered"] + counts["read"]
+
+    return {
+        "total": len(wamids),
+        "counts": counts,
+        "delivered_total": delivered_total,
+        "all_terminal": all_terminal,
+        "statuses": statuses,
+    }
 
 
 # ─────────────────────────────────────────────────────────────
