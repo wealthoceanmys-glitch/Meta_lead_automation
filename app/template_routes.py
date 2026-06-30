@@ -459,13 +459,26 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
             }],
         })
 
-    # Body params
+    # Body params — support named {{name}} and legacy numeric {{1}} variables
     body_params = []
-    # Find how many placeholders are in the body
-    placeholders = re.findall(r"\{\{\d+\}\}", tmpl.body_text or "")
-    for i, _ in enumerate(placeholders):
-        val = variables[i] if i < len(variables) else (contact.name if i == 0 else "")
-        body_params.append({"type": "text", "text": str(val) if val else ""})
+    named_placeholders = re.findall(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}", tmpl.body_text or "")
+    numeric_placeholders = re.findall(r"\{\{(\d+)\}\}", tmpl.body_text or "")
+
+    if named_placeholders:
+        seen: set = set()
+        unique_names = [n for n in named_placeholders if not (n in seen or seen.add(n))]
+        for i, var_name in enumerate(unique_names):
+            if i < len(variables) and variables[i]:
+                val = variables[i]
+            elif var_name in ("name", "customer_name", "client_name", "client"):
+                val = contact.name or ""
+            else:
+                val = variables[i] if i < len(variables) else ""
+            body_params.append({"type": "text", "text": str(val) if val else ""})
+    else:
+        for i, _ in enumerate(numeric_placeholders):
+            val = variables[i] if i < len(variables) else (contact.name if i == 0 else "")
+            body_params.append({"type": "text", "text": str(val) if val else ""})
 
     if body_params:
         components.append({"type": "body", "parameters": body_params})
