@@ -601,16 +601,17 @@ def debug_template_config(user: str = Depends(require_user)):
 
         hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-        # /me
+        # /me — don't request "type" field, it's not available in newer Graph versions
         r = requests.get(f"{GRAPH}/{GV}/me", headers=hdrs,
-                         params={"fields": "id,name,type"}, timeout=10)
+                         params={"fields": "id,name"}, timeout=10)
         if r.status_code == 200:
             me = r.json()
             info["identity"] = f"{me.get('name','?')} (id:{me.get('id','?')})"
-            info["token_type"] = me.get("type", "user")
+            info["token_type"] = "ok"
         else:
-            info["error"] = f"/me failed {r.status_code}: {r.text[:150]}"
-            return info
+            # /me failing is not fatal — token may still work for WABA
+            info["identity"] = f"(could not resolve /me: {r.status_code})"
+            info["token_type"] = "unknown"
 
         # Try WABA templates directly
         if explicit_waba:
