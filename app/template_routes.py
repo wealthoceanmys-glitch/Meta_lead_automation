@@ -442,6 +442,17 @@ def send_bulk(
 
         components = _build_send_components(tmpl, contact)
 
+        # Empty components list means a required variable had no value
+        if components == [] and tmpl.body_text and re.search(r"\{\{[a-zA-Z_]", tmpl.body_text or ""):
+            results.append({
+                "phone": contact.phone,
+                "name": contact.name,
+                "ok": False,
+                "wamid": None,
+                "error": "One or more template variables are empty — check CSV column mapping",
+            })
+            continue
+
         payload = {
             "messaging_product": "whatsapp",
             "to": phone,
@@ -523,20 +534,32 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
     if named_placeholders:
         seen: set = set()
         unique_names = [n for n in named_placeholders if not (n in seen or seen.add(n))]
+        all_empty = True
         for i, var_name in enumerate(unique_names):
             if i < len(variables) and variables[i]:
-                val = variables[i]
+                val = str(variables[i])
+                all_empty = False
             elif var_name in ("name", "customer_name", "client_name", "client"):
                 val = contact.name or ""
+                if val: all_empty = False
             else:
-                val = variables[i] if i < len(variables) else ""
-            body_params.append({"type": "text", "text": str(val) if val else ""})
+                val = ""
+            body_params.append({"type": "text", "text": val})
+        # Only include body params if at least one is non-empty
+        # Meta requires ALL params or NONE — never partial
+        if all_empty:
+            body_params = []
     else:
         for i, _ in enumerate(numeric_placeholders):
             val = variables[i] if i < len(variables) else (contact.name if i == 0 else "")
             body_params.append({"type": "text", "text": str(val) if val else ""})
 
     if body_params:
+        # Validate: Meta requires every parameter to have a non-empty value
+        empty_params = [i+1 for i, p in enumerate(body_params) if not p["text"].strip()]
+        if empty_params:
+            # Return error for this contact instead of sending bad request
+            return []  # caller will handle as failed send
         components.append({"type": "body", "parameters": body_params})
 
     return components
