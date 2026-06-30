@@ -247,7 +247,11 @@ async def upload_header_media(
 ):
     """
     Upload image/video/document to Meta Resumable Upload API.
-    Returns the media handle to use in header_media_handle.
+    Returns the media handle (h:...) to use in header_media_handle
+    when SUBMITTING a template for approval.
+
+    NOTE: This handle is only valid for template creation, NOT for sending.
+    For send-time image uploads, use /upload-send-media instead.
     """
     content = await file.read()
     file_size = len(content)
@@ -295,6 +299,50 @@ async def upload_header_media(
         raise HTTPException(status_code=502, detail="No handle returned from Meta upload")
 
     return {"handle": handle, "filename": file.filename, "size": file_size, "mime": mime}
+
+
+@router.post("/upload-send-media")
+async def upload_send_media(
+    file: UploadFile = File(...),
+    user: str = Depends(require_user),
+):
+    """
+    Upload image/video/document to WhatsApp Cloud API for use at SEND TIME.
+    Uses /{phone_number_id}/media — returns a media_id (numeric string).
+
+    Use this when the user picks an image to send with a template that has
+    an IMAGE/VIDEO/DOCUMENT header component. Pass the returned media_id
+    as header_image_handle in the send-bulk request body.
+
+    Different from /upload-media which returns an h: handle only valid
+    for template submission/approval.
+    """
+    content = await file.read()
+    mime = file.content_type or "image/jpeg"
+    phone_id = (settings.whatsapp_phone_number_id or "").strip()
+    if not phone_id:
+        raise HTTPException(status_code=503, detail="WHATSAPP_PHONE_NUMBER_ID is not set")
+
+    url = f"{GRAPH}/{GV}/{phone_id}/media"
+
+    r = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {settings.whatsapp_access_token}"},
+        data={"messaging_product": "whatsapp", "type": mime},
+        files={"file": (file.filename, content, mime)},
+        timeout=60,
+    )
+
+    logger.info("upload-send-media status=%s body=%s", r.status_code, r.text[:300])
+
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+
+    media_id = r.json().get("id")
+    if not media_id:
+        raise HTTPException(status_code=502, detail="No media ID returned from WhatsApp")
+
+    return {"media_id": media_id, "filename": file.filename, "mime": mime}
 
 
 @router.post("")
@@ -523,31 +571,58 @@ def send_bulk(
 # Internal helpers
 # ─────────────────────────────────────────────────────────────
 
+def _has_real_header_component(tmpl: WhatsAppTemplate) -> bool:
+    """
+    Check whether the approved Meta template actually has a HEADER component
+    by inspecting meta_raw (source of truth from Meta API).
+
+    The DB header_type field may be stale — e.g. set from a media sample
+    in the template editor which is just a preview, NOT a real HEADER component.
+    Always trust meta_raw over the DB field.
+    """
+    if tmpl.meta_raw:
+        for comp in tmpl.meta_raw.get("components", []):
+            if comp.get("type", "").upper() == "HEADER":
+                fmt = comp.get("format", "").upper()
+                return bool(fmt and fmt != "NONE")
+        return False
+    # No meta_raw: fall back to DB field
+    return bool(tmpl.header_type and tmpl.header_type not in ("NONE", ""))
+
+
 def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn, header_image_handle: Optional[str] = None) -> list:
     """Build the template components array for a single send call."""
     components = []
     variables = contact.variables or []
 
-    # Header param
-    if tmpl.header_type == "TEXT" and tmpl.header_text and "{{" in (tmpl.header_text or ""):
-        # TEXT header with variable
-        param_val = variables[0] if variables else (contact.name or "")
-        if param_val:
+    # Only add a header component if the approved template ACTUALLY has one.
+    # We check meta_raw (truth from Meta) rather than the DB header_type field,
+    # because header_type may have been set from a media *sample* (preview only)
+    # rather than a real HEADER component in the approved template.
+    if _has_real_header_component(tmpl):
+        if tmpl.header_type == "TEXT" and tmpl.header_text and "{{" in (tmpl.header_text or ""):
+            # TEXT header with a variable placeholder
+            param_val = variables[0] if variables else (contact.name or "")
+            if param_val:
+                components.append({
+                    "type": "header",
+                    "parameters": [{"type": "text", "text": str(param_val)}],
+                })
+        elif tmpl.header_type in ("IMAGE", "VIDEO", "DOCUMENT") and header_image_handle:
+            # Media header — must use a media_id from /{phone_id}/media (upload-send-media endpoint).
+            # Do NOT use an h: handle from the resumable upload API — that is only valid
+            # for template submission, not for sending messages.
+            media_key = tmpl.header_type.lower()
             components.append({
                 "type": "header",
-                "parameters": [{"type": "text", "text": str(param_val)}],
+                "parameters": [{
+                    "type": media_key,
+                    media_key: {"id": header_image_handle},
+                }],
             })
-    elif tmpl.header_type in ("IMAGE", "VIDEO", "DOCUMENT") and header_image_handle:
-        # Media header — use freshly uploaded handle
-        media_key = tmpl.header_type.lower()
-        components.append({
-            "type": "header",
-            "parameters": [{
-                "type": media_key,
-                media_key: {"id": header_image_handle},
-            }],
-        })
-    # If IMAGE/VIDEO/DOCUMENT but no handle provided: skip header (Meta uses approved sample)
+        # IMAGE/VIDEO/DOCUMENT with no handle provided → skip header entirely
+    # No real HEADER component in approved template → skip entirely
+    # (even if header_type is wrongly set in DB)
 
     # Body params
     # Meta stores body text as {{1}}, {{2}} positional even when named vars were used
@@ -980,6 +1055,11 @@ def sync_templates_from_meta(
             existing.body_text = body_text or existing.body_text
             existing.footer_text = footer_text
             existing.buttons = buttons or existing.buttons
+            # Always sync header fields from Meta — DB may be stale
+            existing.header_type = header_type
+            existing.header_text = header_text
+            if body_variables:
+                existing.body_variables = body_variables
             db.commit()
             skipped.append(name)
         else:
