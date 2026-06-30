@@ -571,42 +571,87 @@ def send_bulk(
 # Internal helpers
 # ─────────────────────────────────────────────────────────────
 
-def _has_real_header_component(tmpl: WhatsAppTemplate) -> bool:
+def _header_info_from_meta_raw(meta_raw: dict) -> dict:
     """
-    Check whether the approved Meta template actually has a HEADER component
-    by inspecting meta_raw (source of truth from Meta API).
+    Inspect meta_raw.components to determine:
+      - Whether a HEADER component exists
+      - Whether it is a SEND-TIME header (no example handle → caller must supply image at send)
+      - Whether it is a MEDIA-SAMPLE-ONLY header (has example.header_handle → approval review only)
 
-    The DB header_type field may be stale — e.g. set from a media sample
-    in the template editor which is just a preview, NOT a real HEADER component.
-    Always trust meta_raw over the DB field.
+    Meta stores both cases as a HEADER component in the API response, but the distinction is:
+      • Real send-time header  → HEADER component with NO example.header_handle
+      • Media sample only      → HEADER component WITH example.header_handle already baked in
+
+    For "media sample only" templates, no header component should be sent at message-send time.
+    The standalone Python script confirms this: sending without a header component works fine.
+
+    Returns dict with keys:
+      has_header_component  bool  — HEADER component exists at all
+      is_send_time_header   bool  — caller must supply image/video/doc at send time
+      is_media_sample_only  bool  — image was for approval only; do NOT send header component
+      header_format         str|None — e.g. 'IMAGE', 'TEXT', 'VIDEO', 'DOCUMENT'
     """
+    result = {
+        "has_header_component": False,
+        "is_send_time_header": False,
+        "is_media_sample_only": False,
+        "header_format": None,
+    }
+    if not meta_raw:
+        return result
+
+    components = meta_raw.get("components", [])
+    for comp in components:
+        if comp.get("type", "").upper() != "HEADER":
+            continue
+
+        fmt = comp.get("format", "").upper()
+        if not fmt or fmt == "NONE":
+            break
+
+        result["has_header_component"] = True
+        result["header_format"] = fmt
+
+        if fmt == "TEXT":
+            # TEXT headers are always real send-time (they carry the text value)
+            result["is_send_time_header"] = True
+            break
+
+        # For IMAGE / VIDEO / DOCUMENT:
+        # If example.header_handle is present → media sample used for approval only
+        # If not present → caller must supply media at send time
+        ex = comp.get("example", {})
+        sample_handles = ex.get("header_handle", []) or ex.get("header_url", [])
+        if sample_handles:
+            # Has a baked-in sample handle → media sample only, do NOT send as header
+            result["is_media_sample_only"] = True
+        else:
+            # No sample handle → truly dynamic, caller must upload image at send time
+            result["is_send_time_header"] = True
+        break
+
+    return result
+
+
+def _has_real_header_component(tmpl: WhatsAppTemplate) -> bool:
+    """True if this template requires a header component at send time (not just a media sample)."""
     if tmpl.meta_raw:
-        components = tmpl.meta_raw.get("components", [])
-        if components:  # only trust meta_raw if it actually has components
-            for comp in components:
-                if comp.get("type", "").upper() == "HEADER":
-                    fmt = comp.get("format", "").upper()
-                    return bool(fmt and fmt != "NONE")
-            return False  # components present but no HEADER found → no header
-    # No meta_raw or empty components: fall back to DB field
+        info = _header_info_from_meta_raw(tmpl.meta_raw)
+        return info["is_send_time_header"]
+    # No meta_raw: fall back to DB field (may be stale)
     return bool(tmpl.header_type and tmpl.header_type not in ("NONE", ""))
 
 
 def _get_real_header_type(tmpl: WhatsAppTemplate) -> Optional[str]:
     """
-    Return the actual header format from meta_raw (e.g. 'IMAGE', 'TEXT', 'VIDEO', 'DOCUMENT').
-    Returns None if no real header component exists.
-    Same meta_raw-first logic as _has_real_header_component.
+    Return the header format only if it is a real send-time header.
+    Returns None for media-sample-only templates even if they have a HEADER component in meta_raw.
     """
     if tmpl.meta_raw:
-        components = tmpl.meta_raw.get("components", [])
-        if components:
-            for comp in components:
-                if comp.get("type", "").upper() == "HEADER":
-                    fmt = comp.get("format", "").upper()
-                    return fmt if fmt and fmt != "NONE" else None
-            return None  # components present but no HEADER found
-    # Fallback to DB
+        info = _header_info_from_meta_raw(tmpl.meta_raw)
+        if info["is_send_time_header"]:
+            return info["header_format"]
+        return None
     if tmpl.header_type and tmpl.header_type not in ("NONE", ""):
         return tmpl.header_type
     return None
@@ -736,11 +781,16 @@ def _tmpl_out(t: WhatsAppTemplate) -> dict:
         "rejection_reason": t.rejection_reason,
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
-        # Include meta_raw so the frontend can check the actual approved components
-        # (e.g. whether a real HEADER component exists vs a media sample preview)
         "meta_raw": t.meta_raw or {},
-        # Authoritative flag — true only if approved template has a real HEADER component
-        # Frontend should use this instead of checking header_type directly
+        # Authoritative header flags computed from meta_raw (not stale DB header_type).
+        # Use these in the frontend to decide whether to show the image upload section.
+        **(_header_info_from_meta_raw(t.meta_raw) if t.meta_raw else {
+            "has_header_component": False,
+            "is_send_time_header": False,
+            "is_media_sample_only": False,
+            "header_format": None,
+        }),
+        # Convenience aliases used by existing frontend code
         "has_real_header": _has_real_header_component(t),
         "real_header_type": _get_real_header_type(t),
     }
