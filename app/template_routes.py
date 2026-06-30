@@ -549,40 +549,42 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
             })
         # If no media link available, skip header component — Meta may use approved sample
 
-    # Body params — support named {{name}} and legacy numeric {{1}} variables
+    # Body params
+    # Meta stores body text as {{1}}, {{2}} positional even when named vars were used
+    # body_variables may store the var names (e.g. ["event_time", "venue_name"])
+    # variables list from CSV is already in correct positional order
     body_params = []
-    named_placeholders = re.findall(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}", tmpl.body_text or "")
     numeric_placeholders = re.findall(r"\{\{(\d+)\}\}", tmpl.body_text or "")
+    named_placeholders = re.findall(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}", tmpl.body_text or "")
 
-    if named_placeholders:
+    # Determine how many params are needed
+    if numeric_placeholders:
+        param_count = len(numeric_placeholders)
+    elif named_placeholders:
         seen: set = set()
-        unique_names = [n for n in named_placeholders if not (n in seen or seen.add(n))]
-        all_empty = True
-        for i, var_name in enumerate(unique_names):
-            if i < len(variables) and variables[i]:
-                val = str(variables[i])
-                all_empty = False
-            elif var_name in ("name", "customer_name", "client_name", "client"):
+        param_count = len([n for n in named_placeholders if not (n in seen or seen.add(n))])
+    else:
+        param_count = 0
+
+    for i in range(param_count):
+        if i < len(variables) and variables[i]:
+            val = str(variables[i])
+        elif named_placeholders and i < len(named_placeholders):
+            # fallback: use name for name-type variables
+            vname = named_placeholders[i]
+            if vname in ("name", "customer_name", "client_name", "client"):
                 val = contact.name or ""
-                if val: all_empty = False
             else:
                 val = ""
-            body_params.append({"type": "text", "text": val})
-        # Only include body params if at least one is non-empty
-        # Meta requires ALL params or NONE — never partial
-        if all_empty:
-            body_params = []
-    else:
-        for i, _ in enumerate(numeric_placeholders):
-            val = variables[i] if i < len(variables) else (contact.name if i == 0 else "")
-            body_params.append({"type": "text", "text": str(val) if val else ""})
+        else:
+            val = contact.name if i == 0 else ""
+        body_params.append({"type": "text", "text": str(val) if val else ""})
 
     if body_params:
-        # Validate: Meta requires every parameter to have a non-empty value
         empty_params = [i+1 for i, p in enumerate(body_params) if not p["text"].strip()]
         if empty_params:
-            # Return error for this contact instead of sending bad request
-            return []  # caller will handle as failed send
+            logger.error("Empty params at positions %s for template %s", empty_params, tmpl.name)
+            return []
         components.append({"type": "body", "parameters": body_params})
 
     return components
@@ -853,6 +855,11 @@ def sync_templates_from_meta(
                 ex = comp.get("example", {})
                 if ex.get("body_text"):
                     body_variables = ex["body_text"][0] if ex["body_text"] else []
+                # Also check for named variable examples (newer Meta API format)
+                if ex.get("body_text_named_params"):
+                    # Store as ordered list of var names for CSV column mapping
+                    named = ex["body_text_named_params"]
+                    body_variables = [p.get("param_name", f"var{i+1}") for i, p in enumerate(named)]
             elif ctype == "FOOTER":
                 footer_text = comp.get("text", "")
             elif ctype == "BUTTONS":
