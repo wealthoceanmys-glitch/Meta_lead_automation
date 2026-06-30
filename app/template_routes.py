@@ -45,31 +45,87 @@ def _wa_headers():
     }
 
 
+# Cache the WABA ID after first successful lookup
+_WABA_ID_CACHE: str = ""
+
+
 def _waba_id() -> str:
     """
-    WABA ID is needed to create templates.
-    We derive it from the phone number info if not stored in settings.
-    Raises HTTPException if unavailable.
+    Return the WhatsApp Business Account ID.
+
+    Resolution order:
+    1. WHATSAPP_BUSINESS_ACCOUNT_ID env var (fastest)
+    2. Derived from WHATSAPP_PHONE_NUMBER_ID via Graph API (auto)
+    3. Derived from META_PAGE_ACCESS_TOKEN phone number list
+
+    The result is cached in memory for the lifetime of the process.
     """
-    waba = getattr(settings, "whatsapp_business_account_id", None)
+    global _WABA_ID_CACHE
+
+    if _WABA_ID_CACHE:
+        return _WABA_ID_CACHE
+
+    # 1. Explicit env var
+    waba = (getattr(settings, "whatsapp_business_account_id", None) or "").strip()
     if waba:
+        _WABA_ID_CACHE = waba
         return waba
-    # Try to look it up from phone number
-    r = requests.get(
-        f"{GRAPH}/{GV}/{settings.whatsapp_phone_number_id}",
+
+    token = (settings.whatsapp_access_token or "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="WHATSAPP_ACCESS_TOKEN is not set.")
+
+    phone_id = (settings.whatsapp_phone_number_id or "").strip()
+
+    # 2. Look up via phone number ID → whatsapp_business_account
+    if phone_id:
+        r = requests.get(
+            f"{GRAPH}/{GV}/{phone_id}",
+            headers=_wa_headers(),
+            params={"fields": "whatsapp_business_account"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            waba = r.json().get("whatsapp_business_account", {}).get("id", "")
+            if waba:
+                _WABA_ID_CACHE = waba
+                logger.info("Auto-resolved WABA ID from phone number: %s", waba)
+                return waba
+
+    # 3. Look up via token's own business account list
+    r2 = requests.get(
+        f"{GRAPH}/{GV}/me/businesses",
         headers=_wa_headers(),
-        params={"fields": "whatsapp_business_account"},
         timeout=15,
     )
-    if r.status_code == 200:
-        waba = r.json().get("whatsapp_business_account", {}).get("id")
-    if not waba:
-        raise HTTPException(
-            status_code=503,
-            detail="Cannot determine WhatsApp Business Account ID. "
-                   "Set WHATSAPP_BUSINESS_ACCOUNT_ID env var.",
-        )
-    return waba
+    if r2.status_code == 200:
+        biz_list = r2.json().get("data", [])
+        if biz_list:
+            # Pick first; each business may have multiple WABAs
+            biz_id = biz_list[0].get("id", "")
+            if biz_id:
+                r3 = requests.get(
+                    f"{GRAPH}/{GV}/{biz_id}/owned_whatsapp_business_accounts",
+                    headers=_wa_headers(),
+                    timeout=15,
+                )
+                if r3.status_code == 200:
+                    waba_list = r3.json().get("data", [])
+                    if waba_list:
+                        waba = waba_list[0].get("id", "")
+                        if waba:
+                            _WABA_ID_CACHE = waba
+                            logger.info("Auto-resolved WABA ID from business: %s", waba)
+                            return waba
+
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Cannot determine WhatsApp Business Account ID. "
+            "Add WHATSAPP_BUSINESS_ACCOUNT_ID to your Render environment variables. "
+            "Find it in Meta Business Manager → Business Settings → WhatsApp Accounts."
+        ),
+    )
 
 
 def _build_meta_payload(t: "TemplateIn") -> dict:
@@ -505,6 +561,95 @@ def _tmpl_out(t: WhatsAppTemplate) -> dict:
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
     }
+
+
+
+@router.get("/debug")
+def debug_template_config(user: str = Depends(require_user)):
+    """
+    Returns resolved config and attempts to auto-detect WABA ID.
+    Call this first if Pull from Meta is failing.
+    """
+    token = (settings.whatsapp_access_token or "").strip()
+    phone_id = (settings.whatsapp_phone_number_id or "").strip()
+    explicit_waba = (getattr(settings, "whatsapp_business_account_id", None) or "").strip()
+
+    result = {
+        "token_set": bool(token),
+        "token_preview": token[:12] + "..." if token else None,
+        "phone_number_id": phone_id or "NOT SET",
+        "explicit_waba_id": explicit_waba or "NOT SET — auto-detecting",
+        "graph_version": GV,
+        "steps": [],
+    }
+
+    if not token:
+        result["error"] = "WHATSAPP_ACCESS_TOKEN is not set"
+        return result
+
+    # Step 1: /me
+    r = requests.get(f"{GRAPH}/{GV}/me", headers=_wa_headers(), timeout=10)
+    result["steps"].append({
+        "step": "/me — token identity",
+        "status": r.status_code,
+        "data": r.json() if r.status_code == 200 else r.text[:200],
+    })
+
+    # Step 2: phone number → WABA
+    if phone_id:
+        r2 = requests.get(
+            f"{GRAPH}/{GV}/{phone_id}",
+            headers=_wa_headers(),
+            params={"fields": "id,display_phone_number,whatsapp_business_account"},
+            timeout=10,
+        )
+        d2 = r2.json() if r2.status_code == 200 else r2.text[:300]
+        result["steps"].append({
+            "step": f"/{phone_id} — phone number info",
+            "status": r2.status_code,
+            "data": d2,
+        })
+        if r2.status_code == 200:
+            waba_from_phone = r2.json().get("whatsapp_business_account", {})
+            result["waba_from_phone_number"] = waba_from_phone or "field not returned (token may lack whatsapp_business_management permission)"
+
+    # Step 3: resolved WABA
+    if explicit_waba:
+        result["resolved_waba_id"] = explicit_waba
+        result["resolution_method"] = "env var WHATSAPP_BUSINESS_ACCOUNT_ID"
+    else:
+        # Try to resolve
+        try:
+            global _WABA_ID_CACHE
+            _WABA_ID_CACHE = ""  # force re-resolve
+            waba = _waba_id()
+            result["resolved_waba_id"] = waba
+            result["resolution_method"] = "auto-detected"
+        except Exception as e:
+            result["resolved_waba_id"] = None
+            result["resolution_method"] = f"FAILED: {e}"
+            result["fix"] = (
+                "Go to business.facebook.com/latest/whatsapp_manager → "
+                "look at the URL for business_id=XXXXXX — that number is your WABA ID. "
+                "Add it to Render as WHATSAPP_BUSINESS_ACCOUNT_ID=XXXXXX"
+            )
+
+    # Step 4: try listing templates if WABA resolved
+    if result.get("resolved_waba_id"):
+        waba = result["resolved_waba_id"]
+        r3 = requests.get(
+            f"{GRAPH}/{GV}/{waba}/message_templates",
+            headers=_wa_headers(),
+            params={"limit": 3, "fields": "id,name,status"},
+            timeout=15,
+        )
+        result["steps"].append({
+            "step": f"/{waba}/message_templates — list test",
+            "status": r3.status_code,
+            "data": r3.json() if r3.status_code == 200 else r3.text[:300],
+        })
+
+    return result
 
 
 @router.post("/sync-from-meta")
