@@ -542,7 +542,25 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
     return components
 
 
+def _extract_header_media_url(meta_raw: dict) -> Optional[str]:
+    """Pull the image/video/document URL from Meta's raw template response if present."""
+    if not meta_raw:
+        return None
+    components = meta_raw.get("components", [])
+    for comp in components:
+        if comp.get("type", "").upper() == "HEADER":
+            fmt = comp.get("format", "").upper()
+            if fmt in ("IMAGE", "VIDEO", "DOCUMENT"):
+                # Meta returns example.header_handle or example.header_url
+                ex = comp.get("example", {})
+                urls = ex.get("header_url", []) or ex.get("header_handle", [])
+                if urls:
+                    return urls[0]
+    return None
+
+
 def _tmpl_out(t: WhatsAppTemplate) -> dict:
+    header_media_url = _extract_header_media_url(t.meta_raw or {})
     return {
         "id": t.id,
         "meta_template_id": t.meta_template_id,
@@ -553,6 +571,7 @@ def _tmpl_out(t: WhatsAppTemplate) -> dict:
         "header_type": t.header_type,
         "header_text": t.header_text,
         "header_media_handle": t.header_media_handle,
+        "header_media_url": header_media_url,   # ← direct URL for preview
         "body_text": t.body_text,
         "body_variables": t.body_variables,
         "footer_text": t.footer_text,
@@ -660,6 +679,73 @@ def debug_template_config(user: str = Depends(require_user)):
 
     # Quick WABA resolve check
     result["waba_id_to_use"] = explicit_waba or "NOT SET — add WHATSAPP_BUSINESS_ACCOUNT_ID to Render"
+
+    return result
+
+
+
+@router.get("/test-token")
+def test_token_raw(user: str = Depends(require_user)):
+    """
+    Calls the WABA message_templates endpoint with the stored token.
+    Returns the raw response so you can see exactly what Meta says.
+    No processing — pure passthrough.
+    """
+    token = (settings.whatsapp_access_token or "").strip()
+    explicit_waba = (getattr(settings, "whatsapp_business_account_id", None) or "").strip()
+
+    result = {
+        "token_length": len(token),
+        "token_first_20": token[:20] + "..." if len(token) > 20 else token,
+        "token_last_10": "..." + token[-10:] if len(token) > 10 else token,
+        "waba_id": explicit_waba,
+        "calls": [],
+    }
+
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Call 1: /me
+    r1 = requests.get(f"{GRAPH}/{GV}/me", headers=headers,
+                      params={"fields": "id,name"}, timeout=10)
+    result["calls"].append({
+        "url": f"{GRAPH}/{GV}/me",
+        "status": r1.status_code,
+        "response": r1.json() if r1.headers.get("content-type","").startswith("application/json") else r1.text[:200],
+    })
+
+    # Call 2: message_templates
+    if explicit_waba:
+        r2 = requests.get(
+            f"{GRAPH}/{GV}/{explicit_waba}/message_templates",
+            headers=headers,
+            params={"fields": "id,name,status", "limit": 3},
+            timeout=15,
+        )
+        result["calls"].append({
+            "url": f"{GRAPH}/{GV}/{explicit_waba}/message_templates",
+            "status": r2.status_code,
+            "response": r2.json() if r2.headers.get("content-type","").startswith("application/json") else r2.text[:300],
+        })
+
+    # Call 3: debug_token (self-introspect)
+    r3 = requests.get(
+        f"{GRAPH}/{GV}/debug_token",
+        headers=headers,
+        params={"input_token": token},
+        timeout=10,
+    )
+    if r3.status_code == 200:
+        data = r3.json().get("data", {})
+        result["token_debug"] = {
+            "is_valid": data.get("is_valid"),
+            "type": data.get("type"),
+            "app_id": data.get("app_id"),
+            "expires_at": "never" if data.get("expires_at") == 0 else data.get("expires_at"),
+            "scopes": data.get("scopes", []),
+            "error": data.get("error"),
+        }
+    else:
+        result["token_debug"] = {"status": r3.status_code, "response": r3.text[:200]}
 
     return result
 
