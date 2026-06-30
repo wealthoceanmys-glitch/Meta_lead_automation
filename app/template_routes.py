@@ -232,7 +232,8 @@ class BulkContactIn(BaseModel):
 
 class BulkSendIn(BaseModel):
     contacts: List[BulkContactIn]
-    variable_map: Optional[List[str]] = None   # column names from CSV mapped to {{1}}, {{2}} …
+    variable_map: Optional[List[str]] = None
+    header_image_handle: Optional[str] = None  # uploaded image handle for IMAGE header templates
 
 
 # ─────────────────────────────────────────────────────────────
@@ -448,7 +449,7 @@ def send_bulk(
             results.append({"phone": contact.phone, "ok": False, "error": "invalid phone"})
             continue
 
-        components = _build_send_components(tmpl, contact)
+        components = _build_send_components(tmpl, contact, data.header_image_handle)
 
         # Empty components list means a required variable had no value
         if components == [] and tmpl.body_text and re.search(r"\{\{[a-zA-Z_]", tmpl.body_text or ""):
@@ -522,26 +523,31 @@ def send_bulk(
 # Internal helpers
 # ─────────────────────────────────────────────────────────────
 
-def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> list:
+def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn, header_image_handle: Optional[str] = None) -> list:
     """Build the template components array for a single send call."""
     components = []
     variables = contact.variables or []
 
-    # Header param — only send if template truly has a TEXT header with variables
-    # IMAGE/VIDEO/DOCUMENT: never send header component (causes #132012)
-    # No header: never send header component
-    has_real_header = (
-        tmpl.header_type == "TEXT"
-        and tmpl.header_text
-        and "{{" in (tmpl.header_text or "")
-    )
-    if has_real_header:
+    # Header param
+    if tmpl.header_type == "TEXT" and tmpl.header_text and "{{" in (tmpl.header_text or ""):
+        # TEXT header with variable
         param_val = variables[0] if variables else (contact.name or "")
         if param_val:
             components.append({
                 "type": "header",
                 "parameters": [{"type": "text", "text": str(param_val)}],
             })
+    elif tmpl.header_type in ("IMAGE", "VIDEO", "DOCUMENT") and header_image_handle:
+        # Media header — use freshly uploaded handle
+        media_key = tmpl.header_type.lower()
+        components.append({
+            "type": "header",
+            "parameters": [{
+                "type": media_key,
+                media_key: {"id": header_image_handle},
+            }],
+        })
+    # If IMAGE/VIDEO/DOCUMENT but no handle provided: skip header (Meta uses approved sample)
 
     # Body params
     # Meta stores body text as {{1}}, {{2}} positional even when named vars were used
