@@ -480,6 +480,18 @@ def send_bulk(
     if tmpl.status not in ("APPROVED", "approved"):
         raise HTTPException(status_code=400, detail=f"Template status is '{tmpl.status}', not APPROVED")
 
+    # If this template has an IMAGE/VIDEO/DOCUMENT header, a media_id is mandatory on
+    # every message. Fail fast with a clear error instead of a misleading "variables empty".
+    real_header_type = _get_real_header_type(tmpl)
+    if real_header_type in ("IMAGE", "VIDEO", "DOCUMENT") and not data.header_image_handle:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This template has a {real_header_type} header. Upload the "
+                f"{real_header_type.lower()} first — its media_id must be sent with every message."
+            ),
+        )
+
     url = f"{GRAPH}/{GV}/{settings.whatsapp_phone_number_id}/messages"
 
     # Log what we received to diagnose variable issues
@@ -573,61 +585,49 @@ def send_bulk(
 
 def _header_info_from_meta_raw(meta_raw: dict) -> dict:
     """
-    Inspect meta_raw.components to determine:
-      - Whether a HEADER component exists
-      - Whether it is a SEND-TIME header (no example handle → caller must supply image at send)
-      - Whether it is a MEDIA-SAMPLE-ONLY header (has example.header_handle → approval review only)
+    Inspect meta_raw.components to determine the template's HEADER component.
 
-    Meta stores both cases as a HEADER component in the API response, but the distinction is:
-      • Real send-time header  → HEADER component with NO example.header_handle
-      • Media sample only      → HEADER component WITH example.header_handle already baked in
+    IMPORTANT — how WhatsApp headers actually work:
+      A template can have at most one HEADER component. Its `format` is one of
+      TEXT / IMAGE / VIDEO / DOCUMENT / LOCATION.
 
-    For "media sample only" templates, no header component should be sent at message-send time.
-    The standalone Python script confirms this: sending without a header component works fine.
+      For IMAGE / VIDEO / DOCUMENT headers, Meta REQUIRES an `example.header_handle`
+      at template-creation time (this is what Meta's editor calls the "Media sample").
+      That example is ALWAYS present on an approved media header — it is NOT a sign
+      that the header is "preview only". At SEND time you must upload a fresh media_id
+      via /{phone_id}/media and pass it as the header parameter, exactly like the
+      standalone send_4hrs_reminder.py script does.
+
+      So: any HEADER with a real format (not NONE) is a send-time header that needs
+      a parameter on every message.
 
     Returns dict with keys:
-      has_header_component  bool  — HEADER component exists at all
-      is_send_time_header   bool  — caller must supply image/video/doc at send time
-      is_media_sample_only  bool  — image was for approval only; do NOT send header component
-      header_format         str|None — e.g. 'IMAGE', 'TEXT', 'VIDEO', 'DOCUMENT'
+      has_header_component  bool      — HEADER component exists at all
+      is_send_time_header   bool      — caller must supply a parameter at send time
+      is_media_sample_only  bool      — kept for backwards-compat, always False now
+      header_format         str|None  — 'TEXT' | 'IMAGE' | 'VIDEO' | 'DOCUMENT'
     """
     result = {
         "has_header_component": False,
         "is_send_time_header": False,
-        "is_media_sample_only": False,
+        "is_media_sample_only": False,  # deprecated: media headers always send the media
         "header_format": None,
     }
     if not meta_raw:
         return result
 
-    components = meta_raw.get("components", [])
-    for comp in components:
+    for comp in meta_raw.get("components", []):
         if comp.get("type", "").upper() != "HEADER":
             continue
 
         fmt = comp.get("format", "").upper()
         if not fmt or fmt == "NONE":
-            break
+            break  # no real header
 
+        # TEXT, IMAGE, VIDEO and DOCUMENT headers all require a parameter at send time.
         result["has_header_component"] = True
         result["header_format"] = fmt
-
-        if fmt == "TEXT":
-            # TEXT headers are always real send-time (they carry the text value)
-            result["is_send_time_header"] = True
-            break
-
-        # For IMAGE / VIDEO / DOCUMENT:
-        # If example.header_handle is present → media sample used for approval only
-        # If not present → caller must supply media at send time
-        ex = comp.get("example", {})
-        sample_handles = ex.get("header_handle", []) or ex.get("header_url", [])
-        if sample_handles:
-            # Has a baked-in sample handle → media sample only, do NOT send as header
-            result["is_media_sample_only"] = True
-        else:
-            # No sample handle → truly dynamic, caller must upload image at send time
-            result["is_send_time_header"] = True
+        result["is_send_time_header"] = True
         break
 
     return result
@@ -662,24 +662,29 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn, heade
     components = []
     variables = contact.variables or []
 
-    # Only add a header component if the approved template ACTUALLY has one.
-    # We check meta_raw (truth from Meta) rather than the DB header_type field,
-    # because header_type may have been set from a media *sample* (preview only)
-    # rather than a real HEADER component in the approved template.
-    if _has_real_header_component(tmpl):
-        if tmpl.header_type == "TEXT" and tmpl.header_text and "{{" in (tmpl.header_text or ""):
-            # TEXT header with a variable placeholder
+    # Determine the real header format from meta_raw (Meta is the source of truth).
+    # The DB header_type field can be stale, so we trust meta_raw via this helper.
+    real_header_type = _get_real_header_type(tmpl)  # 'TEXT' | 'IMAGE' | 'VIDEO' | 'DOCUMENT' | None
+
+    if real_header_type == "TEXT":
+        # TEXT header with a variable placeholder → send the text param
+        if tmpl.header_text and "{{" in (tmpl.header_text or ""):
             param_val = variables[0] if variables else (contact.name or "")
             if param_val:
+                clean_hdr = re.sub(r"[\r\n\t]+", " ", str(param_val)).strip()
                 components.append({
                     "type": "header",
-                    "parameters": [{"type": "text", "text": str(param_val)}],
+                    "parameters": [{"type": "text", "text": clean_hdr}],
                 })
-        elif tmpl.header_type in ("IMAGE", "VIDEO", "DOCUMENT") and header_image_handle:
-            # Media header — must use a media_id from /{phone_id}/media (upload-send-media endpoint).
-            # Do NOT use an h: handle from the resumable upload API — that is only valid
-            # for template submission, not for sending messages.
-            media_key = tmpl.header_type.lower()
+
+    elif real_header_type in ("IMAGE", "VIDEO", "DOCUMENT"):
+        # Media header — REQUIRED on every message. Send the freshly uploaded media_id.
+        # header_image_handle here MUST be a media_id from /{phone_id}/media
+        # (the /upload-send-media endpoint), exactly like send_4hrs_reminder.py.
+        # Do NOT pass an h: resumable-upload handle or the approval example handle —
+        # those cause: "Object with ID ... does not exist / missing permissions".
+        if header_image_handle:
+            media_key = real_header_type.lower()  # 'image' / 'video' / 'document'
             components.append({
                 "type": "header",
                 "parameters": [{
@@ -687,9 +692,14 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn, heade
                     media_key: {"id": header_image_handle},
                 }],
             })
-        # IMAGE/VIDEO/DOCUMENT with no handle provided → skip header entirely
-    # No real HEADER component in approved template → skip entirely
-    # (even if header_type is wrongly set in DB)
+        else:
+            # No media_id provided but the template requires one → fail fast with a clear reason
+            logger.error(
+                "Template %s has a %s header but no media_id was provided for send",
+                tmpl.name, real_header_type,
+            )
+            return []  # signals caller to report "header image required"
+    # real_header_type is None → template has no header, send body only
 
     # Body params
     # Meta stores body text as {{1}}, {{2}} positional even when named vars were used
