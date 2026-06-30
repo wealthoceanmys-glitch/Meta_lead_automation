@@ -714,6 +714,9 @@ def _tmpl_out(t: WhatsAppTemplate) -> dict:
         "rejection_reason": t.rejection_reason,
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+        # Include meta_raw so the frontend can check the actual approved components
+        # (e.g. whether a real HEADER component exists vs a media sample preview)
+        "meta_raw": t.meta_raw or {},
     }
 
 
