@@ -16,6 +16,8 @@ from .utils import clean_phone, get_seminar_details, now_iso
 from .whatsapp import send_template_for_lead, send_text_reply, save_outgoing_template_message
 from .meta import classify_webhook_and_handle, upsert_lead_from_meta
 from .template_routes import router as template_router
+from .whatsapp_status import apply_status_updates
+
 
 app = FastAPI(title="WOI Lead CRM API", version="2.0.0")
 app.include_router(template_router)
