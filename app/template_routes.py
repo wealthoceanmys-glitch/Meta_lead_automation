@@ -723,7 +723,14 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn, heade
         else:
             val = contact.name if i == 0 else ""
 
-        param: dict = {"type": "text", "text": str(val) if val else ""}
+        # Sanitize: Meta error #132018 is thrown when param text contains
+        # newlines, tab characters, or more than 4 consecutive spaces.
+        raw_val = str(val).strip() if val else ""
+        clean_val = re.sub(r"[\r\n\t]+", " ", raw_val)   # newlines/tabs → single space
+        clean_val = re.sub(r" {5,}", "    ", clean_val)    # 5+ consecutive spaces → 4 max
+        clean_val = clean_val.strip()
+
+        param: dict = {"type": "text", "text": clean_val}
 
         # Include parameter_name if we have the variable name stored
         # Meta requires this for templates approved with named variables
