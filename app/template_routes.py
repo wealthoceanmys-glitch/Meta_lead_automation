@@ -464,6 +464,7 @@ def send_bulk(
             },
         }
 
+        logger.info("Sending template payload: %s", payload)
         r = requests.post(url, json=payload, headers=_wa_headers(), timeout=20)
         try:
             resp = r.json()
@@ -509,22 +510,19 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
     components = []
     variables = contact.variables or []
 
-    # Header param (if header has a variable or media)
-    if tmpl.header_type == "TEXT" and tmpl.header_text and "{{" in tmpl.header_text:
+    # Header param
+    # For TEXT headers with variables: send the variable value
+    # For IMAGE/VIDEO/DOCUMENT headers: Meta uses the approved sample automatically
+    # DO NOT send header component for media headers — causes (#132018) error
+    if tmpl.header_type == "TEXT" and tmpl.header_text and "{{" in (tmpl.header_text or ""):
         param_val = variables[0] if variables else (contact.name or "")
-        components.append({
-            "type": "header",
-            "parameters": [{"type": "text", "text": param_val}],
-        })
-    elif tmpl.header_type in ("IMAGE", "VIDEO", "DOCUMENT") and tmpl.header_media_handle:
-        media_key = tmpl.header_type.lower()
-        components.append({
-            "type": "header",
-            "parameters": [{
-                "type": media_key,
-                media_key: {"id": tmpl.header_media_handle},
-            }],
-        })
+        if param_val:
+            components.append({
+                "type": "header",
+                "parameters": [{"type": "text", "text": str(param_val)}],
+            })
+    # Note: IMAGE/VIDEO/DOCUMENT headers don't need parameters when sending —
+    # the approved media sample is used automatically by Meta
 
     # Body params — support named {{name}} and legacy numeric {{1}} variables
     body_params = []
