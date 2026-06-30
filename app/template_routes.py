@@ -528,8 +528,9 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
     variables = contact.variables or []
 
     # Header param
-    # For TEXT headers with variables: send the variable value
-    # For IMAGE/VIDEO/DOCUMENT: send the approved media using its handle/link from meta_raw
+    # TEXT headers with variables: send the variable value
+    # IMAGE/VIDEO/DOCUMENT headers: DO NOT send header component when sending messages
+    # Meta uses the approved sample media automatically — sending CDN links causes (#100)
     if tmpl.header_type == "TEXT" and tmpl.header_text and "{{" in (tmpl.header_text or ""):
         param_val = variables[0] if variables else (contact.name or "")
         if param_val:
@@ -537,25 +538,8 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
                 "type": "header",
                 "parameters": [{"type": "text", "text": str(param_val)}],
             })
-    elif tmpl.header_type in ("IMAGE", "VIDEO", "DOCUMENT"):
-        # Try to get the approved media link from meta_raw
-        media_link = None
-        if tmpl.meta_raw:
-            for comp in (tmpl.meta_raw.get("components") or []):
-                if comp.get("type", "").upper() == "HEADER":
-                    ex = comp.get("example", {})
-                    urls = ex.get("header_url", []) or ex.get("header_handle", [])
-                    if urls:
-                        media_link = urls[0]
-                    break
-        if media_link:
-            media_key = tmpl.header_type.lower()
-            param: dict = {"type": media_key, media_key: {"link": media_link}}
-            components.append({
-                "type": "header",
-                "parameters": [param],
-            })
-        # If no media link available, skip header component — Meta may use approved sample
+    # For IMAGE/VIDEO/DOCUMENT: skip header component entirely
+    # Meta automatically uses the approved sample image when no header component is sent
 
     # Body params
     # Meta stores body text as {{1}}, {{2}} positional even when named vars were used
