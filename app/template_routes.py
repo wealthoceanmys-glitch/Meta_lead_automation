@@ -558,11 +558,13 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
     else:
         param_count = 0
 
+    # Get stored variable names for parameter_name field
+    stored_var_names = tmpl.body_variables or []  # e.g. ["event_time", "venue_name"]
+
     for i in range(param_count):
         if i < len(variables) and variables[i]:
             val = str(variables[i])
         elif named_placeholders and i < len(named_placeholders):
-            # fallback: use name for name-type variables
             vname = named_placeholders[i]
             if vname in ("name", "customer_name", "client_name", "client"):
                 val = contact.name or ""
@@ -570,7 +572,17 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
                 val = ""
         else:
             val = contact.name if i == 0 else ""
-        body_params.append({"type": "text", "text": str(val) if val else ""})
+
+        param: dict = {"type": "text", "text": str(val) if val else ""}
+
+        # Include parameter_name if we have the variable name stored
+        # Meta requires this for templates approved with named variables
+        if i < len(stored_var_names) and stored_var_names[i]:
+            param["parameter_name"] = stored_var_names[i]
+        elif i < len(named_placeholders):
+            param["parameter_name"] = named_placeholders[i]
+
+        body_params.append(param)
 
     if body_params:
         empty_params = [i+1 for i, p in enumerate(body_params) if not p["text"].strip()]
