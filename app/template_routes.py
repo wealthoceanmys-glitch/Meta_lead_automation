@@ -492,3 +492,111 @@ def _tmpl_out(t: WhatsAppTemplate) -> dict:
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
     }
+
+
+@router.post("/sync-from-meta")
+def sync_templates_from_meta(
+    db: Session = Depends(get_db),
+    user: str = Depends(require_user),
+):
+    """
+    Pull all approved templates from Meta WABA and upsert into local DB.
+    This lets you import templates that were created directly in WhatsApp Manager.
+    """
+    waba = _waba_id()
+    r = requests.get(
+        f"{GRAPH}/{GV}/{waba}/message_templates",
+        headers=_wa_headers(),
+        params={
+            "fields": "id,name,status,category,language,components,quality_score,rejected_reason",
+            "limit": 100,
+        },
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=r.json())
+
+    meta_templates = r.json().get("data", [])
+    synced = []
+    skipped = []
+
+    for mt in meta_templates:
+        meta_id = mt.get("id")
+        name = mt.get("name")
+        existing = (
+            db.query(WhatsAppTemplate)
+            .filter(WhatsAppTemplate.meta_template_id == meta_id)
+            .first()
+        )
+
+        # Parse components back into our fields
+        components = mt.get("components", [])
+        header_type = None
+        header_text = None
+        body_text = ""
+        footer_text = None
+        buttons = []
+        body_variables = []
+
+        for comp in components:
+            ctype = comp.get("type", "").upper()
+            if ctype == "HEADER":
+                fmt = comp.get("format", "TEXT").upper()
+                header_type = fmt
+                if fmt == "TEXT":
+                    header_text = comp.get("text", "")
+            elif ctype == "BODY":
+                body_text = comp.get("text", "")
+                # Extract example variable values if present
+                ex = comp.get("example", {})
+                if ex.get("body_text"):
+                    body_variables = ex["body_text"][0] if ex["body_text"] else []
+            elif ctype == "FOOTER":
+                footer_text = comp.get("text", "")
+            elif ctype == "BUTTONS":
+                for b in comp.get("buttons", []):
+                    bt = b.get("type", "").upper()
+                    btn = {"type": bt, "text": b.get("text", "")}
+                    if bt == "URL":
+                        btn["url"] = b.get("url", "")
+                    elif bt == "PHONE_NUMBER":
+                        btn["phone_number"] = b.get("phone_number", "")
+                    buttons.append(btn)
+
+        if existing:
+            existing.status = mt.get("status")
+            existing.rejection_reason = mt.get("rejected_reason")
+            existing.meta_raw = mt
+            existing.body_text = body_text or existing.body_text
+            existing.footer_text = footer_text
+            existing.buttons = buttons or existing.buttons
+            db.commit()
+            skipped.append(name)
+        else:
+            tmpl = WhatsAppTemplate(
+                meta_template_id=meta_id,
+                name=name,
+                category=mt.get("category", "MARKETING"),
+                language=mt.get("language", "en"),
+                status=mt.get("status"),
+                header_type=header_type,
+                header_text=header_text,
+                body_text=body_text,
+                body_variables=body_variables if body_variables else None,
+                footer_text=footer_text,
+                buttons=buttons if buttons else None,
+                rejection_reason=mt.get("rejected_reason"),
+                meta_raw=mt,
+            )
+            db.add(tmpl)
+            synced.append(name)
+
+    db.commit()
+    return {
+        "ok": True,
+        "total_from_meta": len(meta_templates),
+        "newly_imported": len(synced),
+        "updated_existing": len(skipped),
+        "imported": synced,
+        "updated": skipped,
+    }
