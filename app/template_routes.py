@@ -567,87 +567,98 @@ def _tmpl_out(t: WhatsAppTemplate) -> dict:
 @router.get("/debug")
 def debug_template_config(user: str = Depends(require_user)):
     """
-    Returns resolved config and attempts to auto-detect WABA ID.
-    Call this first if Pull from Meta is failing.
+    Diagnoses token permissions and WABA access.
+    Tests both WHATSAPP_ACCESS_TOKEN and META_PAGE_ACCESS_TOKEN.
     """
-    token = (settings.whatsapp_access_token or "").strip()
-    phone_id = (settings.whatsapp_phone_number_id or "").strip()
+    wa_token  = (settings.whatsapp_access_token or "").strip()
+    page_token = (settings.meta_page_access_token or "").strip()
+    phone_id  = (settings.whatsapp_phone_number_id or "").strip()
     explicit_waba = (getattr(settings, "whatsapp_business_account_id", None) or "").strip()
 
-    result = {
-        "token_set": bool(token),
-        "token_preview": token[:12] + "..." if token else None,
-        "phone_number_id": phone_id or "NOT SET",
-        "explicit_waba_id": explicit_waba or "NOT SET — auto-detecting",
+    result: dict = {
         "graph_version": GV,
+        "phone_number_id": phone_id or "NOT SET",
+        "explicit_waba_id": explicit_waba or "NOT SET",
+        "tokens_tested": [],
+        "recommendation": None,
         "steps": [],
     }
 
-    if not token:
-        result["error"] = "WHATSAPP_ACCESS_TOKEN is not set"
-        return result
+    def test_token(token: str, label: str) -> dict:
+        """Run a full permission check on a token."""
+        info: dict = {
+            "label": label,
+            "preview": token[:14] + "..." if token else "EMPTY",
+            "identity": None,
+            "token_type": None,
+            "can_read_waba": False,
+            "template_list_status": None,
+            "error": None,
+        }
+        if not token:
+            info["error"] = "Token is empty"
+            return info
 
-    # Step 1: /me
-    r = requests.get(f"{GRAPH}/{GV}/me", headers=_wa_headers(), timeout=10)
-    result["steps"].append({
-        "step": "/me — token identity",
-        "status": r.status_code,
-        "data": r.json() if r.status_code == 200 else r.text[:200],
-    })
+        hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # Step 2: phone number → WABA
-    if phone_id:
-        r2 = requests.get(
-            f"{GRAPH}/{GV}/{phone_id}",
-            headers=_wa_headers(),
-            params={"fields": "id,display_phone_number,whatsapp_business_account"},
-            timeout=10,
-        )
-        d2 = r2.json() if r2.status_code == 200 else r2.text[:300]
-        result["steps"].append({
-            "step": f"/{phone_id} — phone number info",
-            "status": r2.status_code,
-            "data": d2,
-        })
-        if r2.status_code == 200:
-            waba_from_phone = r2.json().get("whatsapp_business_account", {})
-            result["waba_from_phone_number"] = waba_from_phone or "field not returned (token may lack whatsapp_business_management permission)"
+        # /me
+        r = requests.get(f"{GRAPH}/{GV}/me", headers=hdrs,
+                         params={"fields": "id,name,type"}, timeout=10)
+        if r.status_code == 200:
+            me = r.json()
+            info["identity"] = f"{me.get('name','?')} (id:{me.get('id','?')})"
+            info["token_type"] = me.get("type", "user")
+        else:
+            info["error"] = f"/me failed {r.status_code}: {r.text[:150]}"
+            return info
 
-    # Step 3: resolved WABA
-    if explicit_waba:
-        result["resolved_waba_id"] = explicit_waba
-        result["resolution_method"] = "env var WHATSAPP_BUSINESS_ACCOUNT_ID"
-    else:
-        # Try to resolve
-        try:
-            global _WABA_ID_CACHE
-            _WABA_ID_CACHE = ""  # force re-resolve
-            waba = _waba_id()
-            result["resolved_waba_id"] = waba
-            result["resolution_method"] = "auto-detected"
-        except Exception as e:
-            result["resolved_waba_id"] = None
-            result["resolution_method"] = f"FAILED: {e}"
-            result["fix"] = (
-                "Go to business.facebook.com/latest/whatsapp_manager → "
-                "look at the URL for business_id=XXXXXX — that number is your WABA ID. "
-                "Add it to Render as WHATSAPP_BUSINESS_ACCOUNT_ID=XXXXXX"
+        # Try WABA templates directly
+        if explicit_waba:
+            r2 = requests.get(
+                f"{GRAPH}/{GV}/{explicit_waba}/message_templates",
+                headers=hdrs,
+                params={"limit": 2, "fields": "id,name,status"},
+                timeout=15,
             )
+            info["template_list_status"] = r2.status_code
+            if r2.status_code == 200:
+                info["can_read_waba"] = True
+                info["template_sample"] = [
+                    {"name": t.get("name"), "status": t.get("status")}
+                    for t in r2.json().get("data", [])[:2]
+                ]
+            else:
+                info["template_list_error"] = r2.json().get("error", {}).get("message", r2.text[:150])
+        return info
 
-    # Step 4: try listing templates if WABA resolved
-    if result.get("resolved_waba_id"):
-        waba = result["resolved_waba_id"]
-        r3 = requests.get(
-            f"{GRAPH}/{GV}/{waba}/message_templates",
-            headers=_wa_headers(),
-            params={"limit": 3, "fields": "id,name,status"},
-            timeout=15,
+    # Test both tokens
+    wa_result   = test_token(wa_token,   "WHATSAPP_ACCESS_TOKEN")
+    page_result = test_token(page_token, "META_PAGE_ACCESS_TOKEN")
+    result["tokens_tested"] = [wa_result, page_result]
+
+    # Determine recommendation
+    if wa_result["can_read_waba"]:
+        result["recommendation"] = "WHATSAPP_ACCESS_TOKEN works. Click Pull from Meta."
+        result["working_token"] = "WHATSAPP_ACCESS_TOKEN"
+    elif page_result["can_read_waba"]:
+        result["recommendation"] = (
+            "META_PAGE_ACCESS_TOKEN can read templates. "
+            "Set WHATSAPP_ACCESS_TOKEN = same value as META_PAGE_ACCESS_TOKEN in Render, then redeploy."
         )
-        result["steps"].append({
-            "step": f"/{waba}/message_templates — list test",
-            "status": r3.status_code,
-            "data": r3.json() if r3.status_code == 200 else r3.text[:300],
-        })
+        result["working_token"] = "META_PAGE_ACCESS_TOKEN"
+    else:
+        result["recommendation"] = (
+            "Neither token has whatsapp_business_management permission. "
+            "You need a PERMANENT System User token. Steps: "
+            "1) business.facebook.com → Settings → Users → System Users → "
+            "2) Create/select a system user → Generate New Token → "
+            "3) Select your app → tick 'whatsapp_business_management' + 'whatsapp_business_messaging' → "
+            "4) Copy the token → set as WHATSAPP_ACCESS_TOKEN in Render."
+        )
+        result["working_token"] = None
+
+    # Quick WABA resolve check
+    result["waba_id_to_use"] = explicit_waba or "NOT SET — add WHATSAPP_BUSINESS_ACCOUNT_ID to Render"
 
     return result
 
