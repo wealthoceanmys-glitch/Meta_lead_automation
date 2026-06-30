@@ -527,19 +527,21 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
     components = []
     variables = contact.variables or []
 
-    # Header param
-    # TEXT headers with variables: send the variable value
-    # IMAGE/VIDEO/DOCUMENT headers: DO NOT send header component when sending messages
-    # Meta uses the approved sample media automatically — sending CDN links causes (#100)
-    if tmpl.header_type == "TEXT" and tmpl.header_text and "{{" in (tmpl.header_text or ""):
+    # Header param — only send if template truly has a TEXT header with variables
+    # IMAGE/VIDEO/DOCUMENT: never send header component (causes #132012)
+    # No header: never send header component
+    has_real_header = (
+        tmpl.header_type == "TEXT"
+        and tmpl.header_text
+        and "{{" in (tmpl.header_text or "")
+    )
+    if has_real_header:
         param_val = variables[0] if variables else (contact.name or "")
         if param_val:
             components.append({
                 "type": "header",
                 "parameters": [{"type": "text", "text": str(param_val)}],
             })
-    # For IMAGE/VIDEO/DOCUMENT: skip header component entirely
-    # Meta automatically uses the approved sample image when no header component is sent
 
     # Body params
     # Meta stores body text as {{1}}, {{2}} positional even when named vars were used
@@ -848,6 +850,44 @@ def inspect_template(
     }
 
 
+@router.post("/fix-headers")
+def fix_header_types(
+    db: Session = Depends(get_db),
+    user: str = Depends(require_user),
+):
+    """
+    Fix templates that have wrong header_type in DB by re-checking meta_raw.
+    Run once after deploying to correct any mis-synced templates.
+    """
+    templates = db.query(WhatsAppTemplate).all()
+    fixed = []
+    for t in templates:
+        if not t.meta_raw:
+            continue
+        components = t.meta_raw.get("components", [])
+        has_header = any(c.get("type","").upper() == "HEADER" for c in components)
+        if not has_header and t.header_type:
+            old_val = t.header_type
+            t.header_type = None
+            t.header_text = None
+            t.header_media_handle = None
+            fixed.append({"name": t.name, "old_header_type": old_val})
+        elif has_header:
+            for c in components:
+                if c.get("type","").upper() == "HEADER":
+                    fmt = c.get("format","").upper()
+                    if fmt and fmt != "NONE":
+                        if t.header_type != fmt:
+                            fixed.append({"name": t.name, "old": t.header_type, "new": fmt})
+                            t.header_type = fmt
+                    else:
+                        if t.header_type:
+                            fixed.append({"name": t.name, "old_header_type": t.header_type, "new": None})
+                            t.header_type = None
+    db.commit()
+    return {"fixed": len(fixed), "details": fixed}
+
+
 @router.post("/sync-from-meta")
 def sync_templates_from_meta(
     db: Session = Depends(get_db),
@@ -892,11 +932,16 @@ def sync_templates_from_meta(
         buttons = []
         body_variables = []
 
+        # Reset header fields — only set if HEADER component actually exists
+        header_type = None
+        header_text = None
+
         for comp in components:
             ctype = comp.get("type", "").upper()
             if ctype == "HEADER":
-                fmt = comp.get("format", "TEXT").upper()
-                header_type = fmt
+                fmt = comp.get("format", "NONE").upper()
+                if fmt and fmt != "NONE":
+                    header_type = fmt
                 if fmt == "TEXT":
                     header_text = comp.get("text", "")
             elif ctype == "BODY":
