@@ -487,12 +487,21 @@ def send_bulk(
                 timestamp=now_iso(),
             ))
 
+        error_detail = None
+        if not ok:
+            err = resp.get("error", {})
+            code = err.get("code", "")
+            msg = err.get("message", "")
+            error_sub = err.get("error_data", {}).get("details", "") if isinstance(err.get("error_data"), dict) else ""
+            error_detail = f"(#{code}) {msg}" + (f" — {error_sub}" if error_sub else "")
+            logger.error("Send failed phone=%s code=%s msg=%s payload=%s", phone, code, msg, payload)
+
         results.append({
             "phone": contact.phone,
             "name": contact.name,
             "ok": ok,
             "wamid": wamid,
-            "error": resp.get("error", {}).get("message") if not ok else None,
+            "error": error_detail,
         })
 
     db.commit()
@@ -512,8 +521,7 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
 
     # Header param
     # For TEXT headers with variables: send the variable value
-    # For IMAGE/VIDEO/DOCUMENT headers: Meta uses the approved sample automatically
-    # DO NOT send header component for media headers — causes (#132018) error
+    # For IMAGE/VIDEO/DOCUMENT: send the approved media using its handle/link from meta_raw
     if tmpl.header_type == "TEXT" and tmpl.header_text and "{{" in (tmpl.header_text or ""):
         param_val = variables[0] if variables else (contact.name or "")
         if param_val:
@@ -521,8 +529,25 @@ def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn) -> li
                 "type": "header",
                 "parameters": [{"type": "text", "text": str(param_val)}],
             })
-    # Note: IMAGE/VIDEO/DOCUMENT headers don't need parameters when sending —
-    # the approved media sample is used automatically by Meta
+    elif tmpl.header_type in ("IMAGE", "VIDEO", "DOCUMENT"):
+        # Try to get the approved media link from meta_raw
+        media_link = None
+        if tmpl.meta_raw:
+            for comp in (tmpl.meta_raw.get("components") or []):
+                if comp.get("type", "").upper() == "HEADER":
+                    ex = comp.get("example", {})
+                    urls = ex.get("header_url", []) or ex.get("header_handle", [])
+                    if urls:
+                        media_link = urls[0]
+                    break
+        if media_link:
+            media_key = tmpl.header_type.lower()
+            param: dict = {"type": media_key, media_key: {"link": media_link}}
+            components.append({
+                "type": "header",
+                "parameters": [param],
+            })
+        # If no media link available, skip header component — Meta may use approved sample
 
     # Body params — support named {{name}} and legacy numeric {{1}} variables
     body_params = []
