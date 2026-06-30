@@ -581,13 +581,35 @@ def _has_real_header_component(tmpl: WhatsAppTemplate) -> bool:
     Always trust meta_raw over the DB field.
     """
     if tmpl.meta_raw:
-        for comp in tmpl.meta_raw.get("components", []):
-            if comp.get("type", "").upper() == "HEADER":
-                fmt = comp.get("format", "").upper()
-                return bool(fmt and fmt != "NONE")
-        return False
-    # No meta_raw: fall back to DB field
+        components = tmpl.meta_raw.get("components", [])
+        if components:  # only trust meta_raw if it actually has components
+            for comp in components:
+                if comp.get("type", "").upper() == "HEADER":
+                    fmt = comp.get("format", "").upper()
+                    return bool(fmt and fmt != "NONE")
+            return False  # components present but no HEADER found → no header
+    # No meta_raw or empty components: fall back to DB field
     return bool(tmpl.header_type and tmpl.header_type not in ("NONE", ""))
+
+
+def _get_real_header_type(tmpl: WhatsAppTemplate) -> Optional[str]:
+    """
+    Return the actual header format from meta_raw (e.g. 'IMAGE', 'TEXT', 'VIDEO', 'DOCUMENT').
+    Returns None if no real header component exists.
+    Same meta_raw-first logic as _has_real_header_component.
+    """
+    if tmpl.meta_raw:
+        components = tmpl.meta_raw.get("components", [])
+        if components:
+            for comp in components:
+                if comp.get("type", "").upper() == "HEADER":
+                    fmt = comp.get("format", "").upper()
+                    return fmt if fmt and fmt != "NONE" else None
+            return None  # components present but no HEADER found
+    # Fallback to DB
+    if tmpl.header_type and tmpl.header_type not in ("NONE", ""):
+        return tmpl.header_type
+    return None
 
 
 def _build_send_components(tmpl: WhatsAppTemplate, contact: BulkContactIn, header_image_handle: Optional[str] = None) -> list:
@@ -717,6 +739,10 @@ def _tmpl_out(t: WhatsAppTemplate) -> dict:
         # Include meta_raw so the frontend can check the actual approved components
         # (e.g. whether a real HEADER component exists vs a media sample preview)
         "meta_raw": t.meta_raw or {},
+        # Authoritative flag — true only if approved template has a real HEADER component
+        # Frontend should use this instead of checking header_type directly
+        "has_real_header": _has_real_header_component(t),
+        "real_header_type": _get_real_header_type(t),
     }
 
 
