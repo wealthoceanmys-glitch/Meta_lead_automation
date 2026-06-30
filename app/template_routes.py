@@ -433,6 +433,14 @@ def send_bulk(
 
     url = f"{GRAPH}/{GV}/{settings.whatsapp_phone_number_id}/messages"
 
+    # Log what we received to diagnose variable issues
+    logger.info("SEND-BULK template=%s contacts=%d first_vars=%s body_text_preview=%s",
+        tmpl.name,
+        len(data.contacts),
+        data.contacts[0].variables if data.contacts else "NO_CONTACTS",
+        (tmpl.body_text or "")[:60]
+    )
+
     results = []
     for contact in data.contacts:
         phone = clean_phone(contact.phone)
@@ -796,6 +804,52 @@ def test_token_raw(user: str = Depends(require_user)):
         result["token_debug"] = {"status": r3.status_code, "response": r3.text[:200]}
 
     return result
+
+
+
+@router.get("/inspect-all")
+def inspect_all_templates(db: Session = Depends(get_db)):
+    """Public debug — list all template IDs and names."""
+    templates = db.query(WhatsAppTemplate).all()
+    return [{"id": t.id, "name": t.name, "body_text": (t.body_text or "")[:80], "body_variables": t.body_variables} for t in templates]
+
+
+@router.get("/{template_id}/inspect")
+def inspect_template(
+    template_id: int,
+    db: Session = Depends(get_db),
+):
+    # No auth — debug only, remove after fixing
+    """Show exactly what is stored in DB + what payload will be sent."""
+    import re as _re
+    tmpl = db.query(WhatsAppTemplate).filter(WhatsAppTemplate.id == template_id).first()
+    if not tmpl:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    body_text = tmpl.body_text or ""
+    named = _re.findall(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}", body_text)
+    numeric = _re.findall(r"\{\{(\d+)\}\}", body_text)
+
+    # Simulate what would be sent with dummy variables
+    dummy_vars = [f"VAR_{i+1}" for i in range(max(len(named), len(numeric), len(tmpl.body_variables or [])))]
+
+    contact_sim = BulkContactIn(phone="919741308822", name="Test", variables=dummy_vars)
+    try:
+        components = _build_send_components(tmpl, contact_sim)
+    except Exception as e:
+        components = f"ERROR: {e}"
+
+    return {
+        "id": tmpl.id,
+        "name": tmpl.name,
+        "body_text": body_text,
+        "body_text_named_placeholders": named,
+        "body_text_numeric_placeholders": numeric,
+        "stored_body_variables": tmpl.body_variables,
+        "header_type": tmpl.header_type,
+        "meta_raw_components": (tmpl.meta_raw or {}).get("components", []),
+        "simulated_send_payload_components": components,
+    }
 
 
 @router.post("/sync-from-meta")
