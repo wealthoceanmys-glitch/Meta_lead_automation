@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     whatsapp_phone_number_id: str = Field(default="", alias="WHATSAPP_PHONE_NUMBER_ID")
     whatsapp_business_account_id: str = Field(default="", alias="WHATSAPP_BUSINESS_ACCOUNT_ID")
 
+    # Meta App ID — required for the Resumable Upload API (/{app_id}/uploads) used
+    # when submitting a template with an image/video/document header sample.
+    # Find it in the Meta App Dashboard (developers.facebook.com/apps → your app → App ID).
+    meta_app_id: str = Field(default="", alias="META_APP_ID")
+
     # Old/default template env, kept for backward compatibility
     whatsapp_template_name: str = Field(
         default="woi_seminar_registration_followup",
