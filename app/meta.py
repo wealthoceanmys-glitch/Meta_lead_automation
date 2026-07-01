@@ -344,10 +344,29 @@ def handle_whatsapp_payload(db: Session, payload: dict):
                 lead = db.query(Lead).filter(Lead.whatsapp_message_id == mid).first()
                 msg = db.query(WhatsAppMessage).filter(WhatsAppMessage.wa_message_id == mid).first()
                 if msg:
-                    msg.status = status
+                    # Only move FORWARD through the lifecycle so out-of-order webhooks
+                    # (a late "sent" arriving after "delivered"/"read") can't downgrade
+                    # the status and make the live delivery counts flicker. "failed" is terminal.
+                    _rank = {"accepted": 0, "sent": 1, "delivered": 2, "read": 3, "failed": 4}
+                    _cur = (msg.status or "accepted").lower()
+                    if _cur == "accepted" or _rank.get(status, 0) > _rank.get(_cur, 0):
+                        msg.status = status
+                    # Persist the failure reason (e.g. 131049 marketing frequency cap) onto
+                    # the message row so the CRM send panel can show WHY it wasn't delivered.
+                    if status == "failed":
+                        msg.raw = {
+                            "status": "failed",
+                            "timestamp": ts,
+                            "recipient_id": st.get("recipient_id"),
+                            "errors": st.get("errors") or [],
+                        }
                 if lead and not msg:
+                    _bf_raw = {"source": "status_webhook_backfill", "status": st}
+                    if status == "failed":
+                        # top-level errors so extract_status_error() can read them
+                        _bf_raw["errors"] = st.get("errors") or []
                     msg = save_outgoing_template_message(db, lead, wamid=mid, status=status,
-                        raw={"source": "status_webhook_backfill", "status": st})
+                        raw=_bf_raw)
                 if lead:
                     lead.whatsapp_status = status
                     lead.whatsapp_last_status_at = now_iso()
