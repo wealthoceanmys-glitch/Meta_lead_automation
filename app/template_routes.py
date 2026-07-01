@@ -224,23 +224,35 @@ def _build_meta_payload(t: "TemplateIn") -> dict:
         components.append({"type": "FOOTER", "text": t.footer_text})
 
     # BUTTONS
+    # NOTE: t.buttons is a list of Pydantic ButtonIn objects, so use attribute
+    # access (b.type / b.text), NOT dict .get() — the latter raises AttributeError
+    # and 500s the whole request before CORS headers attach (browser shows
+    # "Failed to fetch"). Normalise to a dict first so the logic is simple.
     if t.buttons:
         btn_list = []
         for b in t.buttons:
-            if b.get("type") == "QUICK_REPLY":
-                btn_list.append({"type": "QUICK_REPLY", "text": b["text"]})
-            elif b.get("type") == "URL":
-                btn_list.append({
-                    "type": "URL",
-                    "text": b["text"],
-                    "url": b.get("url", ""),
-                    **({"example": [b["url_example"]]} if b.get("url_example") else {}),
-                })
-            elif b.get("type") == "PHONE_NUMBER":
+            bd = b.model_dump() if hasattr(b, "model_dump") else (b.dict() if hasattr(b, "dict") else dict(b))
+            btype = bd.get("type")
+            btext = bd.get("text") or ""
+            if btype == "QUICK_REPLY":
+                btn_list.append({"type": "QUICK_REPLY", "text": btext})
+            elif btype == "URL":
+                raw_url = (bd.get("url") or "").strip()
+                url_example = (bd.get("url_example") or "").strip()
+                # If the full link was typed into the example box instead of the URL
+                # box (easy to do in the UI), fall back to it as the actual URL.
+                if not raw_url and url_example:
+                    raw_url = url_example
+                url_btn: dict = {"type": "URL", "text": btext, "url": raw_url}
+                # Meta requires `example` ONLY for DYNAMIC urls containing {{1}}.
+                if "{{" in raw_url and url_example:
+                    url_btn["example"] = [url_example]
+                btn_list.append(url_btn)
+            elif btype == "PHONE_NUMBER":
                 btn_list.append({
                     "type": "PHONE_NUMBER",
-                    "text": b["text"],
-                    "phone_number": b.get("phone_number", ""),
+                    "text": btext,
+                    "phone_number": (bd.get("phone_number") or "").strip(),
                 })
         if btn_list:
             components.append({"type": "BUTTONS", "buttons": btn_list})
