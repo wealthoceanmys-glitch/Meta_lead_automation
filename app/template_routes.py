@@ -152,6 +152,20 @@ def _app_id() -> str:
     return app_id
 
 
+def _extract_body_var_tokens(text: str) -> list:
+    """
+    Return the variable tokens inside a body's {{ }} placeholders, in order of first
+    appearance and de-duplicated. e.g. "Hi {{name}}, on {{date}}" -> ["name", "date"];
+    "Hi {{1}} on {{2}}" -> ["1", "2"].
+    """
+    tokens: list = []
+    for m in re.findall(r"\{\{\s*([^}]+?)\s*\}\}", text or ""):
+        tok = m.strip()
+        if tok and tok not in tokens:
+            tokens.append(tok)
+    return tokens
+
+
 def _build_meta_payload(t: "TemplateIn") -> dict:
     """Convert our TemplateIn schema into the Meta Graph API payload."""
     components = []
@@ -180,8 +194,29 @@ def _build_meta_payload(t: "TemplateIn") -> dict:
 
     # BODY
     body_comp: dict = {"type": "BODY", "text": t.body_text}
-    if t.body_variables:
-        body_comp["example"] = {"body_text": [t.body_variables]}
+    # Meta needs a DIFFERENT example format depending on the variable style:
+    #   • Named vars  {{name}}      → example.body_text_named_params [{param_name, example}]
+    #   • Positional  {{1}} {{2}}   → example.body_text [[ "v1", "v2" ]]
+    # Sending the positional format for a named-variable body triggers error 100
+    # "Invalid parameter". We detect the style from the body text itself.
+    var_tokens = _extract_body_var_tokens(t.body_text)
+    sample_values = list(t.body_variables or [])
+    if var_tokens:
+        is_named = any(not tok.isdigit() for tok in var_tokens)
+        if is_named:
+            named_params = []
+            for i, tok in enumerate(var_tokens):
+                example_val = sample_values[i] if i < len(sample_values) else tok
+                named_params.append({"param_name": tok, "example": str(example_val)})
+            body_comp["example"] = {"body_text_named_params": named_params}
+        else:
+            # positional — one row of example values in numeric order
+            ordered = sorted(var_tokens, key=lambda x: int(x))
+            vals = [
+                str(sample_values[i]) if i < len(sample_values) else f"Sample{i+1}"
+                for i in range(len(ordered))
+            ]
+            body_comp["example"] = {"body_text": [vals]}
     components.append(body_comp)
 
     # FOOTER
@@ -391,10 +426,18 @@ def create_template(
     status = meta_data.get("status", "PENDING")
 
     if r.status_code not in (200, 201) and not meta_id:
-        raise HTTPException(
-            status_code=r.status_code,
-            detail=meta_data.get("error", {}).get("message", str(meta_data)),
+        err = meta_data.get("error", {}) or {}
+        # Meta's most useful text is usually in error_user_msg / error_user_title.
+        detail = (
+            err.get("error_user_msg")
+            or err.get("error_user_title")
+            or err.get("message")
+            or str(meta_data)
         )
+        subcode = err.get("error_subcode")
+        if subcode:
+            detail = f"{detail} (subcode {subcode})"
+        raise HTTPException(status_code=r.status_code, detail=detail)
 
     tmpl = WhatsAppTemplate(
         meta_template_id=meta_id,
