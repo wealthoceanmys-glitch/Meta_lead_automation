@@ -129,6 +129,29 @@ def _waba_id() -> str:
     )
 
 
+def _app_id() -> str:
+    """
+    Return the Meta App ID, required for the Resumable Upload API used to attach a
+    header image/video/document sample when submitting a template for approval.
+
+    The resumable upload edge lives on the APP node (POST /{app_id}/uploads) — NOT
+    on the WhatsApp Business Account. Using the WABA ID here is what produced the
+    error: "Object with ID '<waba>' does not exist ... or does not support this operation".
+    """
+    app_id = (getattr(settings, "meta_app_id", None) or "").strip()
+    if not app_id:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "META_APP_ID is not set. It is required to upload a template header "
+                "sample image. Find it in the Meta App Dashboard "
+                "(developers.facebook.com/apps → your app → App ID) and add it to your "
+                "Render environment variables as META_APP_ID."
+            ),
+        )
+    return app_id
+
+
 def _build_meta_payload(t: "TemplateIn") -> dict:
     """Convert our TemplateIn schema into the Meta Graph API payload."""
     components = []
@@ -258,18 +281,17 @@ async def upload_header_media(
     file_size = len(content)
     mime = file.content_type or "application/octet-stream"
 
-    # Step 1: Create upload session
-    session_url = f"{GRAPH}/{GV}/{_waba_id()}/uploads"
+    # Step 1: Create upload session on the APP node (Resumable Upload API).
+    # This edge is /{app_id}/uploads — using the WABA ID here fails with
+    # "Object ... does not support this operation".
+    session_url = f"{GRAPH}/{GV}/{_app_id()}/uploads"
     r = requests.post(
         session_url,
-        headers={
-            "Authorization": f"Bearer {settings.whatsapp_access_token}",
-            "Content-Type": "application/json",
-        },
-        json={
+        params={
             "file_length": file_size,
             "file_type": mime,
             "file_name": file.filename,
+            "access_token": settings.whatsapp_access_token,
         },
         timeout=20,
     )
