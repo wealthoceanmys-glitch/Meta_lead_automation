@@ -288,6 +288,35 @@ def list_leads(
     rows = query.offset(offset).limit(limit).all()
     return {"total": total, "rows": [LeadOut.model_validate(r).model_dump() for r in rows]}
 
+@app.get("/debug/token-shape")
+def debug_token_shape(user: str = Depends(require_user)):
+    """Safely inspect the token the RUNNING process holds — never reveals it.
+    Shows length, first/last 4 chars, and whether whitespace/quotes are baked in.
+    """
+    import os
+
+    def shape(name):
+        t = os.getenv(name) or ""
+        return {
+            "present": bool(t),
+            "length": len(t),
+            "first4": t[:4],                 # valid Meta tokens start with 'EAA'
+            "last4": t[-4:],
+            "starts_with_EAA": t.startswith("EAA"),
+            "has_space_inside": " " in t,
+            "has_newline_inside": ("\n" in t) or ("\r" in t),
+            "has_quote": ('"' in t) or ("'" in t),
+            "changes_after_strip": t != t.strip(),
+        }
+
+    checked = ["META_PAGE_ACCESS_TOKEN", "META_ACCESS_TOKEN",
+               "PAGE_ACCESS_TOKEN", "GRAPH_ACCESS_TOKEN", "FACEBOOK_ACCESS_TOKEN"]
+    shapes = {n: shape(n) for n in checked}
+
+    # which token get_meta_token() actually picks (same priority order)
+    winner = next((n for n in checked if os.getenv(n)), None)
+    return {"winning_var": winner, "shapes": shapes}
+
 
 @app.post("/leads", response_model=LeadOut)
 def create_lead(data: LeadCreate, db: Session = Depends(get_db), user: str = Depends(require_user)):
