@@ -130,21 +130,6 @@ def debug_config(user: str = Depends(require_user)):
     }
 
 
-@app.get("/debug/graph-lead")
-def debug_graph_lead(
-    leadgen_id: str = "",
-    ad_id: str = "",
-    user: str = Depends(require_user),
-):
-    """Dump the raw Graph API response chain (lead -> ad -> adset -> campaign).
-
-    Answers 'what are we actually receiving from Graph API?' empirically.
-    Pass either a real leadgen_id or an ad_id.
-    """
-    from app.debug_graph import diagnose_lead_chain
-    return diagnose_lead_chain(leadgen_id=leadgen_id, ad_id=ad_id)
-
-
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
