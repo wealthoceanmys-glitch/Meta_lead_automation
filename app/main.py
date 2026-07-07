@@ -130,6 +130,97 @@ def debug_config(user: str = Depends(require_user)):
     }
 
 
+@app.get("/debug/graph-lead")
+def debug_graph_lead(
+    leadgen_id: str = "",
+    ad_id: str = "",
+    user: str = Depends(require_user),
+):
+    """Dump the raw Graph API response chain (lead -> ad -> adset -> campaign),
+    including live token introspection. Pass a real leadgen_id or ad_id.
+    """
+    from app.debug_graph import diagnose_lead_chain
+    return diagnose_lead_chain(leadgen_id=leadgen_id, ad_id=ad_id)
+
+
+@app.post("/admin/backfill-blank-leads")
+def backfill_blank_leads(
+    lead_id: str = "",
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    user: str = Depends(require_user),
+):
+    """Re-fetch leads saved with blank name/phone (e.g. captured while the Meta
+    token was expired) and update them in place — keyed by meta_lead_id, so no
+    duplicates are created.
+
+    Doubles as a LIVE token test: if the current token is bad, each result carries
+    a 'fetch_error'; if it's good, name/phone get populated.
+
+      POST /admin/backfill-blank-leads                 -> fix up to `limit` blank leads
+      POST /admin/backfill-blank-leads?lead_id=<id>    -> fix one specific meta_lead_id
+
+    WhatsApp is NOT re-sent during backfill (auto_send=False).
+    """
+    if lead_id:
+        leads = db.query(Lead).filter(Lead.meta_lead_id == str(lead_id)).all()
+    else:
+        leads = (
+            db.query(Lead)
+            .filter(
+                Lead.meta_lead_id.isnot(None),
+                or_(
+                    Lead.full_name.is_(None), Lead.full_name == "",
+                    Lead.phone.is_(None), Lead.phone == "",
+                ),
+            )
+            .order_by(Lead.id.desc())
+            .limit(limit)
+            .all()
+        )
+
+    results = []
+    for lead in leads:
+        before = {"name": lead.full_name, "phone": lead.phone}
+        try:
+            updated, _wa = upsert_lead_from_meta(db, lead.meta_lead_id, auto_send=False)
+            raw = updated.raw or {}
+            fetch_error = raw.get("fetch_error") or raw.get("error_text")
+            results.append({
+                "meta_lead_id": lead.meta_lead_id,
+                "db_id": lead.id,
+                "before": before,
+                "after": {"name": updated.full_name, "phone": updated.phone},
+                "http_status": raw.get("http_status"),
+                "fetch_error": fetch_error,
+                "fixed": bool(updated.phone) and not before["phone"],
+            })
+        except Exception as exc:
+            results.append({
+                "meta_lead_id": lead.meta_lead_id,
+                "db_id": lead.id,
+                "before": before,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    fixed = sum(1 for r in results if r.get("fixed"))
+    any_fetch_error = any(r.get("fetch_error") for r in results)
+    return {
+        "scanned": len(results),
+        "fixed": fixed,
+        "token_verdict": (
+            "TOKEN STILL BAD — every re-fetch returned an error. The token the running "
+            "process is using is not valid. Most likely: env var changed but service NOT "
+            "redeployed, or the new token is in the wrong slot (must be META_PAGE_ACCESS_TOKEN)."
+            if any_fetch_error and fixed == 0
+            else "TOKEN OK — leads were re-fetched and name/phone populated."
+            if fixed > 0
+            else "Nothing to fix, or no change — inspect individual results below."
+        ),
+        "results": results,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
